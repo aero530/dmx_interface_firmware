@@ -8,8 +8,10 @@
 //! set <key> <value>    -> apply one setting (persisted to EEPROM), ok/err
 //! dmx <start> <count>  -> "dmx <ch> v v v ..." lines (16 per line) from the active
 //!                         input's universe, in that mode's addressing, then ok
-//! info                 -> mode/module/ip/mac/net/boot summary, then ok
-//! mac [xx:xx:xx:xx:xx:xx] -> show, or program, the MAC (takes effect at boot)
+//! info                 -> mode/module/ip/mac/net/boot/diag summary, then ok
+//! mac [xx:xx:xx:xx:xx:xx|clear] -> show, program, or clear the MAC. Any
+//!     unicast address is accepted; `clear` reverts to the built-in one
+//!     derived from the chip ID. Both take effect at the next boot.
 //! provision            -> write the module-type and schema bytes (fresh EEPROM)
 //! help                 -> command list
 //! ```
@@ -226,6 +228,8 @@ async fn handle_line(
             respond(class, &format!("mac={}\n", mac_text(data.mac))).await?;
             respond(class, &format!("net={:?}\n", data.net_status)).await?;
             respond(class, &format!("boot={:?}\n", data.boot_status)).await?;
+            // Display / expander bring-up steps reached so far (see diag.rs).
+            respond(class, &format!("diag={}\n", crate::diag::text())).await?;
             respond(class, "ok\n").await?;
         }
 
@@ -233,6 +237,19 @@ async fn handle_line(
             None => {
                 respond(class, &format!("mac={}\n", mac_text(current(global_rx).mac))).await?;
                 respond(class, "ok\n").await?;
+            }
+            // `mac clear` puts the unit back on its built-in address.
+            //
+            // Without this there is no way back. `eeprom::read_mac` falls back
+            // to `identity::mac_fallback()` when the stored bytes are all 0xFF,
+            // all zero, or multicast — and `parse_mac` rejects all three as
+            // addresses, exactly as it should. So every value that would
+            // restore the fallback is a value the console refuses to set, and a
+            // unit that has been provisioned once could only be reverted by
+            // rewriting the EEPROM off-board.
+            Some(word) if word.eq_ignore_ascii_case("clear") || word.eq_ignore_ascii_case("default") => {
+                CHANNEL_EEPROM.send(EepromEvent::WriteMacAddress([0xFF; 6])).await;
+                respond(class, "ok (cleared; the built-in address applies at next boot)\n").await?;
             }
             Some(text) => match parse_mac(text) {
                 Ok(mac) => {
@@ -257,7 +274,7 @@ async fn handle_line(
         }
 
         "help" => {
-            respond(class, "get | set <key> <value> | dmx <start> <count> | info | mac [xx:xx:xx:xx:xx:xx] | provision\n").await?;
+            respond(class, "get | set <key> <value> | dmx <start> <count> | info | mac [xx:xx:xx:xx:xx:xx|clear] | provision\n").await?;
             respond(class, "ok\n").await?;
         }
 

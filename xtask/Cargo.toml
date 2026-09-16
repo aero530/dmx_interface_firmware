@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Host-side build helper: `cargo uf2` builds the pico2 firmware and converts it to a UF2 for BOOTSEL flashing"
+
+# Deliberately dependency-free: the UF2 container and the ELF program headers
+# are both a few dozen lines of fixed-layout little-endian structs, and a
+# helper that pulls in `object`/`goblin` would drag host-only crates into the
+# embedded workspace's Cargo.lock for no gain.
+[dependencies]
+
+[[bin]]
+name = "xtask"
+test = false
+bench = false

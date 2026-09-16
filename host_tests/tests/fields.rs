@@ -1,6 +1,14 @@
 //! Tests for the settings-field metadata table (`common/src/ui/fields.rs`).
 
-use common::ui::{all_fields, FieldId, InputMode, LedPower, MenuData, ModuleSettings, PAGES};
+use common::ui::{
+    all_fields, backlight_duty, FieldId, InputMode, LedPower, MenuData, ModuleSettings,
+    MIN_BACKLIGHT_DUTY, PAGES,
+};
+
+/// Mirrors `pico2::tft_ui`: 35 columns, less one at each side for the panel's
+/// rounded corners. Kept here as a plain number because the grid constants
+/// live in the target crate, which this one cannot depend on.
+const USABLE_COLUMNS: usize = 35 - 2;
 
 fn defaults() -> MenuData {
     MenuData::default()
@@ -340,9 +348,65 @@ fn every_port_is_reachable_from_the_menu() {
 }
 
 #[test]
+fn values_fit_the_usable_width() {
+    // Labels and values share one row, and the panel's rounded corners cost a
+    // column at each side (`tft_ui::CORNER_INSET`), so a value has
+    // `USABLE_COLUMNS - VALUE_COLUMN` to render in. Anything longer runs off
+    // the right-hand edge of the glass, where it cannot be read at all.
+    let room = USABLE_COLUMNS - common::ui::fields::VALUE_COLUMN as usize;
+    let mut data = defaults();
+    // Enum fields render a word, not a number, so walk each one through its
+    // whole cycle rather than trusting the default variant to be the longest.
+    for field in all_fields() {
+        for _ in 0..16 {
+            field.adjust(&mut data, 0, true);
+            let text = field.display(&data);
+            assert!(
+                text.chars().count() <= room,
+                "{:?} renders {:?} ({} chars), over the {} columns available",
+                field,
+                text,
+                text.chars().count(),
+                room
+            );
+        }
+        assert!(
+            field.display_width() <= room,
+            "{:?} declares a {}-column value, over the {} available",
+            field,
+            field.display_width(),
+            room
+        );
+    }
+}
+
+#[test]
+fn backlight_never_goes_below_the_readable_floor() {
+    // Menu level 1 used to be the PWM duty itself: 0.4 %, which is not visible
+    // on the Rev 2 panel. Level 1 now maps to the dimmest duty that is.
+    assert_eq!(backlight_duty(1), MIN_BACKLIGHT_DUTY);
+    assert_eq!(backlight_duty(0), MIN_BACKLIGHT_DUTY, "0 is not a menu value, but clamp anyway");
+    assert_eq!(backlight_duty(255), 255, "the top of the scale is still full brightness");
+
+    let mut last = 0;
+    for level in 1..=255u8 {
+        let duty = backlight_duty(level);
+        assert!(duty >= MIN_BACKLIGHT_DUTY, "level {level} gave duty {duty}");
+        assert!(duty >= last, "level {level} is dimmer than {}", level - 1);
+        last = duty;
+    }
+    // Above the floor the rescale is within a count of the identity it
+    // replaced, so settings saved by older firmware look unchanged.
+    for level in [10u8, 64, 128, 200, 254] {
+        let delta = backlight_duty(level).abs_diff(level);
+        assert!(delta <= 1, "level {level} moved by {delta}");
+    }
+}
+
+#[test]
 fn labels_fit_before_the_value_column() {
-    // Labels and values share one 35-column row on the TFT; a label that runs
-    // into the value column overwrites the value it is labelling.
+    // Labels and values share one row on the TFT; a label that runs into the
+    // value column overwrites the value it is labelling.
     for field in all_fields() {
         assert!(
             field.label().len() < common::ui::fields::VALUE_COLUMN as usize,

@@ -9,6 +9,20 @@ name = "pico2"
 test = false
 bench = false
 
+# Standalone bench panel probe — see src/bin/panel_probe.rs. Built on demand
+# with `cargo uf2 --bin panel_probe`; not part of the shipped firmware.
+[[bin]]
+name = "panel_probe"
+test = false
+bench = false
+
+# Variant B of the probe: same reset path, CS static low. Isolates which of the
+# two differences from Rev 2 actually matters.
+[[bin]]
+name = "panel_probe_staticcs"
+test = false
+bench = false
+
 [features]
 # Mirrors nucleo: `usb` swaps defmt logging for `log` over a USB CDC interface.
 # `common/usb` must track it so the shared sources pick the same macros.
@@ -46,6 +60,14 @@ embassy-net = { version = "0.9.1", features = [
     "defmt", "dns", "udp", "tcp", "dhcpv4", "medium-ethernet", "proto-ipv6",
     # sACN is multicast, one group per universe.
     "multicast",
+    # Reply to ping. smoltcp 0.13 moved the automatic ICMP echo reply behind
+    # this feature, and it is in smoltcp's *default* set — which embassy-net
+    # turns off (`default-features = false`), so nothing enables it unless we
+    # ask. Without it the node answers ARP, takes a DHCP lease and passes
+    # Art-Net traffic, but silently ignores every echo request, so the first
+    # thing anyone does to check a node on site fails while the node is
+    # entirely healthy. Stage 5 of `docs/BRINGUP.md` pings it on purpose.
+    "auto-icmp-echo-reply",
 ] }
 embassy-net-wiznet = { version = "0.3.0", features = ["defmt"] }
 # sACN joins one multicast group per universe, a 32-universe window

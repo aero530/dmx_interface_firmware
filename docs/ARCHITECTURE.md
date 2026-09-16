@@ -67,6 +67,7 @@ to the STM32 generation this replaced — the Art-Net task ported unchanged.
 | `pico2/` | RP2350 (`thumbv8m.main-none-eabihf`) | The firmware: peripheral setup, PIO programs, executor wiring |
 | `host_tests/` | host | Tests `common` directly — 71 tests |
 | `dmx_console/` | host | Desktop settings/monitor app |
+| `xtask/` | host | `cargo uf2`: builds pico2 and converts the ELF to an RP2350 UF2 for BOOTSEL flashing |
 | `rp2040_dmx/` | RP2040 | Rev 1 bench firmware, kept for the FT232R emulator |
 | `nucleo/` | STM32H563ZI | **Frozen.** The previous generation, kept as the record of the extraction |
 
@@ -158,9 +159,17 @@ RGBW at 450/string is byte-for-byte identical to RGB at 600/string.
 
 Two ceilings apply, and **the strip one bites first**: WS2812 is 30 µs/LED,
 SK6812 RGBW 40 µs/LED, so at 2400 B/port the strip alone needs 24 ms — a 42 Hz
-ceiling already below the 44 Hz Art-Net rate. Single-SPI MACRAW realistically
-delivers 8–15 Mbps. Above roughly 2400 B/port the WS2812 protocol is the wall,
-not the link, **which makes QSPI insurance rather than a dependency**.
+ceiling already below the 44 Hz Art-Net rate. Above roughly 2400 B/port the
+WS2812 protocol is the wall, not the link, **which makes QSPI insurance rather
+than a dependency**.
+
+**Measured, 2026-09-15:** the boot probe settled the transport at **12 MHz**,
+not the 20 MHz this table was drawn against — 20 and 16 MHz both failed the
+version read (see §11). Single-SPI MACRAW at 12 MHz realistically delivers
+6–9 Mbps against the 6.5 Mbps the 1800 B/port row needs, so **the design point
+still fits but the margin is thin**, and the row below it does not. Confirm with
+the Stage 7 flood before treating 600 LEDs/port as a supported configuration.
+This is the number QSPI buys back, and the first real argument for doing it.
 
 The ingest risk is *broadcast* Art-Net, not your own universes. Art-Net 4 pushes
 controllers to unicast, driven by ArtPollReply — which is why that packet being
@@ -335,6 +344,17 @@ a future board, these are the places the firmware has to follow.
 
 Conventions that are not obvious from the netlist:
 
+- **mipidsi gets a no-op reset pin, deliberately.** Its builder sends `SWRESET`
+  only when no reset pin is supplied. The real RES is on the I²C expander and so
+  cannot be an `OutputPin`, but passing `NoResetPin` made mipidsi issue a
+  `SWRESET` *after* the expander's hardware pulse — a combination this ST7789P3
+  does not recover from, and which cost a day of bring-up to find because the SPI
+  bus is write-only and the panel simply stays dark. `tft_ui::NoReset` steers
+  mipidsi down the hardware-reset branch while the expander does the real work.
+  Do not "simplify" it back to `NoResetPin`.
+- **CS is statically low and that is fine.** Rev 1 framed every transfer with CS
+  via `ExclusiveDevice`; this panel does not require it, verified on the bench.
+  That is what lets CS live on the expander at all.
 - **DMX direction is fail-safe receive.** `DE` low = receive. GP10 drives Q1's
   gate, not the opto LED, so *any* undriven state — boot, reset, unflashed,
   crashed — lands in receive and cannot jam the bus. GP10 high = transmit.
@@ -394,12 +414,83 @@ Behavioural limits worth knowing before they are mistaken for faults:
   are unaffected (the DMA completes exactly and the PIO stalls on a full FIFO
   until the next read). The fix is an async display path; not worth it unless
   the bench shows it.
+- **The W6300 SPI clock is measured at boot, and then deliberately derated.**
+  The PIO SPI latches MISO at the rising edge of SCK; the W6300 presents each
+  bit on the preceding falling edge. A read is correct only while the SCK half
+  period exceeds the chip's output delay plus whatever the sampling path adds.
+  When it is not, **it fails silently** — every byte arrives shifted one bit
+  right, because each sample catches the previous bit. The first board read its
+  version register as `0x08` (exactly `0x11 >> 1`) and looked like a dead chip.
+
+  Two things came out of chasing that, 2026-09-15:
+
+  1. **The input synchroniser was costing most of the clock.** Every PIO input
+     passes through two flops, so the value latched is the pin as it was ~2
+     `clk_sys` cycles (13.3 ns) earlier — pure lag, dragging the effective
+     sample from mid-bit back to roughly a quarter of the way in. `main.rs`
+     bypasses it for GP19 only. Safe here because MISO is not asynchronous: the
+     W6300 clocks it out from the SCK this state machine generates. Ceiling went
+     **15 → 24 MHz**.
+  2. **The chip's output delay is 19–20 ns**, and that is now the limit. Two
+     independent measurements agree: 15 MHz pass / 16 fail through the
+     synchroniser implies 17.9–20.0 ns; 24 pass / 26 fail bypassed implies
+     19.2–20.8 ns.
+
+  `w6300::PROBE_FREQS_HZ` walks 32 → 2 MHz at boot, accepting a rate only after
+  16 consecutive clean reads, and reports the ceiling as `eth_max=`. The link
+  then runs at `OPERATING_MAX_HZ` (20 MHz), reported as `eth_hz=`. **The two are
+  kept apart on purpose:** running at the 24 MHz ceiling would leave under 2 ns
+  of margin against an output delay that moves with temperature, supply and
+  part-to-part spread, and the failure corrupts *register* reads — which carry
+  the driver's RX pointers and frame sizes, so it can wedge the link rather than
+  merely drop a frame. 20 MHz leaves ~5 ns, a quarter of a bit, and costs
+  nothing §6 can spend.
+
+  Watch `eth_max=` over a board's life: a falling ceiling is the transport
+  degrading, and nothing else reports it.
+- **The TFT SPI clock is held at 5 MHz by the board, not by the panel.**
+  `DISPLAY.SCK` is measurably capacitive — analog scope shows a sine rather than
+  a square above ~10 MHz, a 58 % swing at a 52 ns half-period, implying an RC
+  time constant near 20 ns on that net. The RP2350 pad defaults to 4 mA drive.
+  Rev 1 ran this same panel model at 100 MHz requested (~50 MHz actual), so the
+  limit is the net, not the controller. **The fix, if it is ever worth making:
+  raise the SCK and MOSI pad drive to 12 mA in `main.rs` and walk `TFT_SPI_HZ`
+  back up while watching the waveform.** Nothing needs it today — the only cost
+  of 5 MHz is the first full-screen redraw (~110 KB, a few hundred bytes per
+  keypress after that), and display timing is not in any critical path. Noted
+  because it is a real board characteristic that will look like a new fault to
+  whoever meets it next; it is not, and it was **not** the blank-panel bug.
+- **The panel's corners are radiused, so the grid is inset one column each
+  side** (`tft_ui::CORNER_INSET`): 33 of 35 columns are usable. Measured at
+  about one character clipped per corner on the top and bottom rows. The inset
+  applies to every row so the label column stays straight.
 - **sACN priority and sequence are not honoured.** Two sources on one universe
   interleave last-wins rather than the higher priority winning; out-of-order
   packets are rendered as they arrive. Fine for a single console.
-- **A DHCP lease that renews to a different address updates the ArtPollReply
-  but not the display** — the title row keeps the boot-time address until the
-  next boot. Renewals to the same address, the normal case, are unaffected.
+- **ICMP echo reply is a feature flag, not a given.** smoltcp 0.13 moved the
+  automatic reply behind `auto-icmp-echo-reply`, which is in its default set —
+  and embassy-net depends on smoltcp with `default-features = false`, so nothing
+  enables it implicitly. Missed until 2026-09-16, when the node was found
+  holding a DHCP lease and passing Art-Net while ignoring every ping. It is
+  enabled in `pico2/Cargo.toml`. Worth knowing because the symptom looks like a
+  network fault rather than a build-configuration one: ARP works, DHCP works,
+  Art-Net works, and only the one thing an installer reaches for first is dead.
+- **Exactly one task may `wait_*` on the network stack.** `embassy-net` keeps a
+  single-slot `WakerRegistration` for stack-state changes, so a second waiter on
+  `wait_config_up`/`wait_link_up` silently displaces the first and the displaced
+  task is never woken again — no error, no log, it just stops. The Art-Net task
+  is that waiter. Anything else that needs link or address state **polls**
+  (`is_link_up`, `config_v4`), which is what `w6300::net_watch_task` does. This
+  bit once, 2026-09-15: a diagnostic task added to report link state took the
+  slot and its flag never appeared. Had the spawn order been reversed it would
+  have hung Art-Net instead, which is the same bug with much worse symptoms.
+- **Network status has one writer.** `net_watch_task` derives the reported
+  address from the stack every 250 ms rather than latching whatever the boot
+  sequence or the Art-Net task saw first. That removes an ordering race over who
+  reported last — the symptom was `info` showing a valid `ip=` alongside
+  `net=Dhcp` — and it means a DHCP renewal onto a different address, or a lease
+  lost with the cable, now updates the title row and `info` instead of showing
+  the boot-time value until the next reboot.
 - **ArtPoll's target Port-Address range is parsed but not honoured** — the node
   replies to every poll. Controllers tolerate the extra replies.
 

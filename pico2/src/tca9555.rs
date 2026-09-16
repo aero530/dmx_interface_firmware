@@ -66,7 +66,15 @@ pub const USB_LED_FLT: u8 = 1 << 7;
 /// behind an I²C round trip at all.
 pub const DISPLAY_RES: u8 = 1 << 0;
 /// Port 1, bit 1 — TFT chip select. Static: the display is the only device on
-/// SPI1, so it is selected once at init and stays selected.
+/// SPI1, so it is asserted once at init and stays asserted.
+///
+/// **It must be HIGH while the panel is held in reset.** The ST7789's serial
+/// interface initialises its bit counter when CS is high, so the controller
+/// has to see a clean high-to-low chip-select edge *after* RES is released or
+/// it never synchronises to the byte stream. Rev 2's first build drove RES and
+/// CS low in the same write, so the panel left reset with CS already low and
+/// ignored a perfectly formed init sequence — the Rev 1 board hid this because
+/// `ExclusiveDevice` held CS high except during transfers.
 pub const DISPLAY_CS: u8 = 1 << 1;
 
 /// Direction masks: a 1 bit is an input, a 0 bit is an output.
@@ -93,9 +101,10 @@ impl<I2C: I2c> Tca9555<I2C> {
             addr,
             // Port 0: USB_LED_EN low — never power strips from a USB port
             // before the firmware has decided to. Port 1: RES low (display held
-            // in reset until `release_display_reset`), CS low (selected),
-            // everything else high.
-            out: [!USB_LED_EN, !(DISPLAY_RES | DISPLAY_CS)],
+            // in reset until `release_display_reset`) and **CS high**, so the
+            // panel is deselected while it is being reset; `select_display`
+            // asserts CS afterwards. Everything else high.
+            out: [!USB_LED_EN, !DISPLAY_RES],
         }
     }
 
@@ -137,8 +146,17 @@ impl<I2C: I2c> Tca9555<I2C> {
     }
 
     /// Take the TFT out of reset. Held low from `init` so the controller sees a
-    /// clean edge once its supply has settled; CS is already low.
+    /// clean edge once its supply has settled. CS is still high at this point.
     pub async fn release_display_reset(&mut self) -> Result<(), I2C::Error> {
         self.set(1, DISPLAY_RES, true).await
+    }
+
+    /// Assert the TFT's chip select, after [`release_display_reset`].
+    ///
+    /// The falling edge here is what synchronises the ST7789's serial
+    /// interface; see [`DISPLAY_CS`]. Separate from the reset release so the
+    /// two land in different I²C transactions and the edge is unambiguous.
+    pub async fn select_display(&mut self) -> Result<(), I2C::Error> {
+        self.set(1, DISPLAY_CS, false).await
     }
 }

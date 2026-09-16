@@ -26,6 +26,7 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::i2c::I2c;
 
+use crate::diag;
 use crate::supervisor::CORE1_ALIVE;
 use crate::tca9555::{self, Tca9555, BTN_DOWN, BTN_ESC, BTN_SELECT, BTN_UP};
 
@@ -75,13 +76,25 @@ pub async fn run<I2C: I2c>(
 ) -> ! {
     Timer::after(CARRIER_SETTLE).await;
 
-    if expander.init().await.is_err() {
+    if expander.init().await.is_ok() {
+        diag::set(diag::EXPANDER_OK);
+    } else {
         // Not fatal on its own, but the panel is dead and the display will
         // never come out of reset, so say which of the I²C parts failed.
+        diag::set(diag::EXPANDER_FAIL);
         error!("TCA9555: init failed - no panel, no display");
     }
     if expander.release_display_reset().await.is_err() {
+        diag::set(diag::EXPANDER_RES_FAIL);
         error!("TCA9555: could not release the display reset");
+    }
+    // Then, as a separate transaction, assert CS: the panel must see the
+    // chip-select fall *after* it leaves reset or its serial interface never
+    // synchronises. See `tca9555::DISPLAY_CS`.
+    if expander.select_display().await.is_ok() {
+        diag::set(diag::TFT_CS_ASSERTED);
+    } else {
+        error!("TCA9555: could not assert the display chip select");
     }
     // Signalled even on failure so the UI task logs its init result instead of
     // waiting forever; if RES really is stuck low the expander error above is

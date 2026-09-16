@@ -48,17 +48,17 @@ use embassy_rp::uart::{self, BufferedInterruptHandler as UartInterruptHandler, B
 use embassy_rp::pio_programs::spi::Spi as PioSpi;
 use embassy_rp::spi::{Config as SpiConfig, Spi as HwSpi};
 use embassy_rp::watchdog::{ResetReason, Watchdog};
-use embedded_hal_bus::spi::ExclusiveDevice;
 use static_cell::StaticCell;
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
 use embassy_rp::multicore::{spawn_core1, Stack as CoreStack};
-use embassy_time::{Delay, Timer};
+use embassy_time::Timer;
 use panic_probe as _;
 
 mod artnet;
 mod buttons;
 mod console_usb;
+mod diag;
 mod dmx;
 mod dmx_pio;
 mod eeprom;
@@ -66,6 +66,7 @@ mod enttec_uart;
 mod enttec_widget;
 mod event_router;
 mod m24x02;
+mod panel_test;
 mod pca9633;
 mod sacn_rx;
 mod smart_led;
@@ -165,6 +166,31 @@ pub mod pins {
 }
 
 
+/// SPI clock for the TFT.
+///
+/// Two separate ceilings, and the second is the one that bites:
+///
+/// * **Spec**: the ST7789's minimum serial *write* cycle is 66 ns — a 15 MHz
+///   limit. (An earlier comment here claimed ~62 MHz, which is the *read*
+///   figure misread, and the clock was set to 40 MHz.)
+/// * **This board**: `DISPLAY.SCK` is measurably capacitive. Scoped on the
+///   panel connector at 9.6 MHz it is not a square wave at all but a sine
+///   swinging ~0.5 V to ~2.4 V, never reaching either rail, while MOSI beside
+///   it is clean and full-swing — SCK is the only line toggling every bit, so
+///   it loads first. A 58 % swing at a 52 ns half-period implies an RC time
+///   constant near 20 ns on that net.
+///
+/// Note the Rev 1 board drove this same panel model at **100 MHz requested /
+/// ~50 MHz actual** (`nucleo/src/main.rs`, SPI5) and worked, so the panel
+/// itself is happy far above anything here — the 3 MHz figure elsewhere in
+/// these notes was the WS2812 LED SPI, not the display. Clock rate is
+/// therefore a signal-integrity workaround on this board, not a panel limit.
+///
+/// Sweep this if the waveform is not square: halve until SCK reaches the
+/// rails, then leave margin. Cost is only the first full-screen redraw
+/// (~110 KB); per-keypress redraws are a few hundred bytes.
+const TFT_SPI_HZ: u32 = 5_000_000;
+
 /// Incomplete boots in a row before the lockout guard skips Ethernet.
 ///
 /// One incomplete boot is what a power blip during bring-up looks like, and
@@ -231,7 +257,7 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 async fn boot_task(
     spawner: Spawner,
     mut ee: m24x02::M24x02<I2cDev>,
-    spi_dev: w6300::SpiDev,
+    spi_parts: w6300::SpiParts,
     int: Input<'static>,
     reset: Output<'static>,
 ) {
@@ -285,7 +311,7 @@ async fn boot_task(
         info!("boot: Ethernet disabled in settings");
         NetStatus::Off
     } else {
-        net_bringup(spawner, &mut ee, &settings, spi_dev, int, reset).await
+        net_bringup(spawner, &mut ee, &settings, spi_parts, int, reset).await
     };
     let _ = channels::CHANNEL.try_send(RouterEvent::StoreNetStatus(net_status));
 
@@ -322,7 +348,7 @@ async fn net_bringup(
     spawner: Spawner,
     ee: &mut m24x02::M24x02<I2cDev>,
     settings: &common::ui::MenuData,
-    spi_dev: w6300::SpiDev,
+    spi_parts: w6300::SpiParts,
     int: Input<'static>,
     reset: Output<'static>,
 ) -> common::events::NetStatus {
@@ -339,7 +365,7 @@ async fn net_bringup(
 
     static W6300_STATE: StaticCell<w6300::W6300State> = StaticCell::new();
     let Some((device, eth_runner)) =
-        w6300::init(mac, W6300_STATE.init(w6300::W6300State::new()), spi_dev, int, reset).await
+        w6300::init(mac, W6300_STATE.init(w6300::W6300State::new()), spi_parts, int, reset).await
     else {
         // Deliberately not fatal: DMX, USB and the LEDs all still work without a
         // network, and the boot-flag / lockout logic depends on reaching this
@@ -377,10 +403,11 @@ async fn net_bringup(
         RoscRng.next_u64(),
     );
     spawner.spawn(unwrap!(w6300::net_task(net_runner)));
+    // Owns the reported address, and says *why* one never appeared.
+    spawner.spawn(unwrap!(w6300::net_watch_task(stack)));
     spawner.spawn(unwrap!(artnet::artnet_task(
         stack,
         channels::CHANNEL_DMX.sender(),
-        channels::CHANNEL.sender(),
         unwrap!(channels::CHANNEL_DMX_FEEDBACK.receiver()),
     )));
     spawner.spawn(unwrap!(sacn_rx::sacn_task(
@@ -498,14 +525,27 @@ fn main() -> ! {
         p.PIN_19,                   // IO1 / MISO
         p.DMA_CH8, p.DMA_CH9, Irqs, spi_cfg,
     );
-    let spi_dev = ExclusiveDevice::new(spi_bus, Output::new(p.PIN_16, Level::High), Delay)
-        .expect("W6300 chip select");
+    // Sample MISO without the two-flop input synchroniser. See
+    // `w6300::PROBE_FREQS_HZ`: those two `clk_sys` cycles (~13 ns) are pure
+    // lag on the read path and were costing most of the usable clock rate.
+    //
+    // Bypassing is safe *here* specifically because MISO is not an
+    // asynchronous input: the W6300 clocks it out from the SCK this very state
+    // machine generates, so its transitions are causally tied to our own clock
+    // rather than free-running. The sample then lands mid-bit, roughly 25 ns
+    // clear of the transition on either side at 20 MHz, which is nowhere near
+    // a setup window. Only GP19 is bypassed — the WS2812 machines sharing PIO0
+    // are output-only and must keep their defaults.
+    pio0.set_input_sync_bypass(1 << 19, 1 << 19);
+    // Bus and CS stay apart: `w6300::init` probes for a usable clock before it
+    // joins them into the `SpiDevice` the driver takes ownership of.
+    let spi_parts = w6300::SpiParts { bus: spi_bus, cs: Output::new(p.PIN_16, Level::High) };
 
     // ---- TFT on SPI1 --------------------------------------------------------
     // Blocking (mipidsi). CS and RES are static lines on the expander; the UI
     // task builds the display once the button task has released them.
     let mut tft_cfg = SpiConfig::default();
-    tft_cfg.frequency = 40_000_000; // ST7789 write cycle allows ~62 MHz
+    tft_cfg.frequency = TFT_SPI_HZ;
     let tft_spi = HwSpi::new_blocking_txonly(p.SPI1, p.PIN_14, p.PIN_11, tft_cfg);
     let tft_dc = Output::new(p.PIN_12, Level::Low);
 
@@ -601,7 +641,7 @@ fn main() -> ! {
         s.spawn(unwrap!(boot_task(
             s,
             eeprom_dev,
-            spi_dev,
+            spi_parts,
             Input::new(p.PIN_15, Pull::Up), // W6300 INT
             Output::new(p.PIN_22, Level::High), // W6300 RSTn
         )));

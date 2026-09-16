@@ -1,0 +1,9 @@
+# Workspace-root aliases. Run these from the repo root — inside pico2/ that
+# crate's .cargo/config.toml selects the ARM target and the host tool would
+# not build.
+[alias]
+# `cargo uf2`             build pico2 --release and write pico2.uf2 for BOOTSEL flashing
+# `cargo uf2 --features usb`   same, for the USB-logger variant (pico2-usb.uf2)
+# `cargo uf2 --no-build`  convert the ELF already in target/ without rebuilding
+uf2 = ["run", "--quiet", "--release", "--package", "xtask", "--", "uf2"]
+xtask = ["run", "--quiet", "--release", "--package", "xtask", "--"]

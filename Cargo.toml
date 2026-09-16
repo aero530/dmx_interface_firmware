@@ -1,10 +1,16 @@
 [workspace]
 resolver = "3"
-members = [ "common", "pico2", "rp2040_dmx"]
+members = [ "common", "pico2", "rp2040_dmx", "xtask"]
 # dmx_console (PC tool) and host_tests (host-runnable firmware unit tests)
 # have their own dependency trees; keeping them out of the embedded
 # workspace keeps Cargo.lock clean. rp2040 is an empty placeholder crate,
 # excluded until it has real code.
+#
+# `xtask` is a dependency-free host helper (`cargo uf2` builds the firmware
+# and converts the ELF to a UF2 for BOOTSEL flashing). It has no dependencies,
+# so it does not touch the critical-section unification below. Run it from
+# this directory: inside pico2/ the .cargo/config.toml there forces the ARM
+# target and the host tool would not build.
 #
 # NOTE: `cargo build --workspace` is not supported — build from inside each
 # crate's folder (which also applies its .cargo/config.toml target/runner).

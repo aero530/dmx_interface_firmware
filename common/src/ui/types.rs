@@ -101,6 +101,31 @@ pub struct MenuData {
 /// Backlight duty a fresh unit boots with.
 pub const DEFAULT_BACKLIGHT: u8 = 200;
 
+/// PWM duty the *dimmest* menu setting produces.
+///
+/// The menu's backlight range is 1..=255 and used to be the PWM duty directly,
+/// which put the bottom of the scale below anything useful: at the very bottom
+/// the duty steps are a doubling apart, and level 1 (0.4 %) was not readable on
+/// the Rev 2 panel while level 2 (0.8 %) was. Rather than move the menu's
+/// minimum to 2 — leaving a setting nobody should pick — level 1 now *maps* to
+/// that duty and the rest of the range is rescaled onto it.
+pub const MIN_BACKLIGHT_DUTY: u8 = 2;
+
+/// Map a menu backlight level (1..=255) onto a PWM duty
+/// ([`MIN_BACKLIGHT_DUTY`]..=255).
+///
+/// Linear, with both ends pinned: level 1 gives the dimmest *usable* duty and
+/// level 255 gives full brightness. Above the bottom of the scale this is
+/// within one count of the identity it replaced, so existing saved settings
+/// look unchanged.
+pub const fn backlight_duty(level: u8) -> u8 {
+    if level <= 1 {
+        return MIN_BACKLIGHT_DUTY;
+    }
+    let span = 255 - MIN_BACKLIGHT_DUTY as u32;
+    (MIN_BACKLIGHT_DUTY as u32 + (level as u32 - 1) * span / 254) as u8
+}
+
 impl Default for MenuData {
     fn default() -> Self {
         Self {

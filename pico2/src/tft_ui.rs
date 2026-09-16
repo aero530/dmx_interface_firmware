@@ -29,6 +29,10 @@
 //! `MAX_FIELDS_PER_PAGE`. Change the font and that budget changes with it; the
 //! test in `host_tests` is what keeps the page table honest about it.
 //!
+//! The panel's corners are radiused, so `CORNER_INSET` keeps content one column
+//! clear of each side and **33 columns are usable**. Rows are unaffected: the
+//! bottom two are spare at the page sizes in the field table today.
+//!
 //! # Why blocking SPI
 //!
 //! mipidsi is blocking. Ratatui only redraws cells that changed, so a keypress
@@ -43,7 +47,7 @@ use common::channels::{RouterChannelTx, UiChannelRx};
 use common::event_router::RouterEvent;
 use common::events::{NetStatus, UiEvent};
 use common::ui::fields::VALUE_COLUMN;
-use common::ui::{MenuData, DEFAULT_BACKLIGHT, PAGES};
+use common::ui::{backlight_duty, MenuData, DEFAULT_BACKLIGHT, PAGES};
 use common::usb_power;
 use common::{DISPLAY_HEIGHT, DISPLAY_OFFSET, DISPLAY_WIDTH};
 use defmt::*;
@@ -60,12 +64,13 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::{ColorInversion, Orientation, Rotation};
-use mipidsi::{Builder, Display, NoResetPin};
-use mousefood::{EmbeddedBackend, EmbeddedBackendConfig};
+use mipidsi::{Builder, Display};
+use mousefood::{EmbeddedBackend, EmbeddedBackendConfig, TerminalAlignment};
 use ratatui_core::style::{Modifier, Style};
 use ratatui_core::terminal::Terminal;
 use static_cell::StaticCell;
 
+use crate::diag;
 use crate::pca9633::Pca9633;
 
 /// Character grid the font and panel produce; the field table is checked
@@ -73,9 +78,59 @@ use crate::pca9633::Pca9633;
 pub const COLUMNS: u16 = 35;
 pub const ROWS: u16 = 11;
 
+/// Columns given up at each side to the panel's **rounded corners**.
+///
+/// The glass corners are radiused, so the first and last character cell of the
+/// top and bottom rows is clipped — measured at about one character per corner
+/// on the 1.47" module (2026-09-15). Only those two rows are actually affected,
+/// but the inset applies to every row: the labels all start in one column, and
+/// indenting just the last row would read as a bug rather than as a margin.
+const CORNER_INSET: u16 = 1;
+
+/// First column content may use, and one past the last.
+const CONTENT_LEFT: u16 = CORNER_INSET;
+const CONTENT_RIGHT: u16 = COLUMNS - CORNER_INSET;
+
+/// Value text starts here, allowing for the inset.
+const VALUE_X: u16 = CONTENT_LEFT + VALUE_COLUMN;
+
+/// The widest value any field renders must still fit inside the inset area.
+/// `IpAddrMenu` is the longest at `255.255.255.255`.
+const _: () = core::assert!(VALUE_X + 15 <= CONTENT_RIGHT);
+
 /// Chip select is a static line on the expander, so the SPI bus abstraction
 /// gets a pin that does nothing.
+///
+/// Verified on the bench 2026-09-15: this panel works with CS held statically
+/// low, so it does not need per-transaction framing and CS can stay on the
+/// I²C expander.
 pub struct NoCs;
+
+/// A reset pin that does nothing — the *real* RES is on the expander and the
+/// button task has already pulsed it before this task runs.
+///
+/// This exists to steer mipidsi, not to drive hardware. Its builder sends
+/// `SWRESET` **only** when no reset pin is supplied; given one, it toggles the
+/// pin instead and issues no software reset. On this ST7789P3 panel the
+/// combination Rev 2 used — a hardware RES pulse from the expander *followed*
+/// by mipidsi's `SWRESET` — leaves the controller unresponsive: a textbook init
+/// and a full frame of correct pixels go out on the wire (confirmed with a
+/// logic capture on the panel's own connector) and nothing reaches the glass.
+/// Handing over this no-op pin reproduces the Rev 1 path, which works.
+pub struct NoReset;
+
+impl embedded_hal::digital::ErrorType for NoReset {
+    type Error = core::convert::Infallible;
+}
+
+impl embedded_hal::digital::OutputPin for NoReset {
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 impl embedded_hal::digital::ErrorType for NoCs {
     type Error = core::convert::Infallible;
@@ -92,7 +147,7 @@ impl embedded_hal::digital::OutputPin for NoCs {
 
 type SpiDev = ExclusiveDevice<Spi<'static, SPI1, Blocking>, NoCs, embedded_hal_bus::spi::NoDelay>;
 type Di = SpiInterface<'static, SpiDev, Output<'static>>;
-type Tft = Display<Di, ST7789, NoResetPin>;
+type Tft = Display<Di, ST7789, NoReset>;
 
 /// mipidsi's SPI interface batches pixel data through this before each
 /// transfer; 512 B keeps a row of text in one transaction.
@@ -173,12 +228,32 @@ pub async fn ui_task(
     // RES released and CS asserted by the button task over I²C — see the
     // module docs for why init must wait for it.
     display_ready.wait().await;
+    diag::set(diag::TFT_RES_RELEASED);
     // ST7789: 120 ms after reset before the first command is honoured.
     Timer::after_millis(120).await;
+
+    // Bare-metal panel test, before anything else touches the bus. See
+    // `panel_test.rs` for why this exists and how to read the result.
+    let (spi, dc) = if crate::panel_test::ENABLED {
+        let mut spi = spi;
+        let mut dc = dc;
+        info!("panel test: full ST7789 init, filling frame RAM red then green");
+        crate::panel_test::raw_init_and_fill(&mut spi, &mut dc, 0xF800).await; // red
+        Timer::after_millis(1500).await;
+        crate::panel_test::raw_init_and_fill(&mut spi, &mut dc, 0x07E0).await; // green
+        Timer::after_millis(1500).await;
+        diag::set(diag::PANEL_TEST_DONE);
+        (spi, dc)
+    } else {
+        (spi, dc)
+    };
 
     let dev = ExclusiveDevice::new_no_delay(spi, NoCs).expect("TFT chip select");
     let di = SpiInterface::new(dev, dc, DI_BUFFER.init([0; 512]));
     let mut display: Tft = match Builder::new(ST7789, di)
+        // Suppresses mipidsi's SWRESET — see `NoReset`. The expander has
+        // already pulsed the real RES line.
+        .reset_pin(NoReset)
         // Native portrait geometry; the controller's 240-wide frame memory is
         // centred on the 172-pixel glass, hence the offset.
         .display_size(DISPLAY_WIDTH, DISPLAY_HEIGHT)
@@ -187,16 +262,33 @@ pub async fn ui_task(
         .invert_colors(ColorInversion::Inverted)
         .init(&mut Delay)
     {
-        Ok(d) => d,
+        Ok(d) => {
+            diag::set(diag::TFT_INIT_OK);
+            d
+        }
         Err(_) => {
+            diag::set(diag::TFT_INIT_FAIL);
             error!("TFT: init failed - no display");
             return;
         }
     };
-    let _ = display.clear(Rgb565::BLACK);
+    // Colour splash: red, green, blue, then black. A bring-up aid that costs
+    // half a second at boot and answers three questions from across the bench
+    // with no probe attached: does the panel hear SPI at all (no splash = no),
+    // are the colours right (cyan/magenta/yellow = `ColorInversion` is wrong),
+    // and if the splash shows but the menu does not, the fault is in the
+    // Ratatui/mousefood draw path, not the panel.
+    for colour in [Rgb565::RED, Rgb565::GREEN, Rgb565::BLUE, Rgb565::BLACK] {
+        let _ = display.clear(colour);
+        Timer::after_millis(150).await;
+    }
+    diag::set(diag::TFT_SPLASH_DONE);
 
     // Backlight last, so the first thing visible is the menu.
-    if backlight.init(DEFAULT_BACKLIGHT).await.is_err() {
+    if backlight.init(backlight_duty(DEFAULT_BACKLIGHT)).await.is_ok() {
+        diag::set(diag::BACKLIGHT_OK);
+    } else {
+        diag::set(diag::BACKLIGHT_FAIL);
         error!("PCA9633: init failed - backlight off");
     }
     info!("TFT: up, {}x{} grid", COLUMNS, ROWS);
@@ -205,12 +297,22 @@ pub async fn ui_task(
         // Direct-draw display: nothing to flush.
         flush_callback: alloc::boxed::Box::new(|_d: &mut Tft| {}),
         font_regular: FONT_9X15,
+        // 35x9 px = 315 of 320 and 11x15 px = 165 of 172, so the grid leaves 5
+        // columns and 7 rows of pixels spare. Centring spreads them evenly
+        // instead of banking the whole margin at the right and bottom edges,
+        // which buys a couple of pixels of clearance from the rounded corners.
+        horizontal_alignment: TerminalAlignment::Center,
+        vertical_alignment: TerminalAlignment::Center,
         ..Default::default()
     };
     let backend = EmbeddedBackend::<Tft, Rgb565>::new(&mut display, config);
     let mut terminal = match Terminal::new(backend) {
-        Ok(t) => t,
+        Ok(t) => {
+            diag::set(diag::TERMINAL_OK);
+            t
+        }
         Err(_) => {
+            diag::set(diag::TERMINAL_FAIL);
             error!("TFT: terminal init failed");
             return;
         }
@@ -226,17 +328,22 @@ pub async fn ui_task(
             let page = &PAGES[cursor.page];
             let status = net_text(net);
             let power = usb_power_text();
-            let _ = terminal.draw(|frame| {
+            let drawn = terminal.draw(|frame| {
                 let buf = frame.buffer_mut();
                 // Title row: page name left, network status right.
-                buf.set_string(0, 0, page.title, Style::new().add_modifier(Modifier::REVERSED));
-                let x = COLUMNS.saturating_sub(status.len() as u16);
+                buf.set_string(
+                    CONTENT_LEFT,
+                    0,
+                    page.title,
+                    Style::new().add_modifier(Modifier::REVERSED),
+                );
+                let x = CONTENT_RIGHT.saturating_sub(status.len() as u16);
                 buf.set_string(x, 0, &status, Style::new());
                 // Between the page name and the network status: only shown
                 // when the strips are actually running off the USB brick, so
                 // an operator can tell at a glance why the output is dimmed.
                 if !power.is_empty() {
-                    let px = (page.title.len() as u16) + 1;
+                    let px = CONTENT_LEFT + (page.title.len() as u16) + 1;
                     if px + (power.len() as u16) < x {
                         buf.set_string(px, 0, &power, Style::new());
                     }
@@ -252,14 +359,14 @@ pub async fn ui_task(
                     let y = row as u16 + 1;
                     // Label left, value from VALUE_COLUMN; labels are kept
                     // shorter than that in the field table.
-                    buf.set_string(0, y, field.label(), style);
+                    buf.set_string(CONTENT_LEFT, y, field.label(), style);
 
                     match &mode {
                         // Show the draft, not the live value, and mark the digit
                         // being changed so it is obvious which one Up/Down moves.
                         Mode::Edit { digit, draft } if selected => {
                             let text = field.display(draft);
-                            buf.set_string(VALUE_COLUMN, y, &text, Style::new());
+                            buf.set_string(VALUE_X, y, &text, Style::new());
                             // Dotted quads have dots between the digit
                             // positions; the field says where its digit is.
                             let col = field.cursor_column(*digit) as usize;
@@ -267,17 +374,18 @@ pub async fn ui_task(
                                 let mut one = String::new();
                                 one.push(ch);
                                 buf.set_string(
-                                    VALUE_COLUMN + col as u16,
+                                    VALUE_X + col as u16,
                                     y,
                                     &one,
                                     Style::new().add_modifier(Modifier::REVERSED),
                                 );
                             }
                         }
-                        _ => buf.set_string(VALUE_COLUMN, y, field.display(&data), style),
+                        _ => buf.set_string(VALUE_X, y, field.display(&data), style),
                     }
                 }
             });
+            diag::set(if drawn.is_ok() { diag::FIRST_FRAME } else { diag::DRAW_ERROR });
         }
 
         let event = rx.receive().await;
@@ -291,15 +399,23 @@ pub async fn ui_task(
                 *m = Mode::Navigate;
                 if data.backlight != brightness {
                     brightness = data.backlight;
-                    if backlight.set_brightness(brightness).await.is_err() {
+                    if backlight.set_brightness(backlight_duty(brightness)).await.is_err() {
                         error!("PCA9633: brightness write failed");
                     }
                 }
             }
             (_, UiEvent::Net(status)) => net = status,
 
-            (Mode::Navigate, UiEvent::Up) => cursor.step(false),
-            (Mode::Navigate, UiEvent::Down) => cursor.step(true),
+            // Up and Down are **inverted while navigating** and upright while
+            // editing. That asymmetry is deliberate, chosen on the panel
+            // itself (2026-09-15): moving through a list feels like scrolling
+            // the list under a fixed highlight, so Down brings the entries
+            // below into reach and the highlight travels up the page — while a
+            // number under the cursor has to go up when Up is pressed, because
+            // there the button is acting on the value and not on the view.
+            // Do not "fix" one of these to match the other.
+            (Mode::Navigate, UiEvent::Up) => cursor.step(true),
+            (Mode::Navigate, UiEvent::Down) => cursor.step(false),
             // Esc jumps to the next page.
             (Mode::Navigate, UiEvent::Esc) => {
                 cursor.page = (cursor.page + 1) % PAGES.len();
@@ -311,6 +427,7 @@ pub async fn ui_task(
                 }
             }
 
+            // Upright here — see the note on the navigate arms above.
             (Mode::Edit { digit, draft }, UiEvent::Up) => field.adjust(draft, *digit, true),
             (Mode::Edit { digit, draft }, UiEvent::Down) => field.adjust(draft, *digit, false),
             // Esc discards the draft outright.

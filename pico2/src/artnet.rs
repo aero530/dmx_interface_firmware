@@ -40,12 +40,16 @@ pub async fn artnet_task(
     // runner: Runner<'static, Ethernet<'static, ETH, GenericPhy>>,
     // spawner: Spawner,
     tx: DmxChannelTx,
-    tx_router: RouterChannelTx,
     mut rx: DmxFeedbackChannelRx,
 ) {
-    // Ensure DHCP configuration is up before trying connect
+    // Ensure DHCP configuration is up before trying to bind.
+    //
+    // This is the *only* task that may wait here: `embassy-net` keeps one
+    // waker slot for stack-state changes, so a second waiter would displace
+    // this one and neither side would report an error. Anything else that
+    // needs to know about the link polls instead — see `w6300::net_watch_task`,
+    // which also owns reporting the address.
     info!("Waiting for DHCP...");
-    let _ = tx_router.try_send(RouterEvent::StoreNetStatus(NetStatus::Dhcp));
     let _a = stack.wait_config_up().await;
 
     let cfg = stack.config_v4().unwrap();
@@ -54,8 +58,6 @@ pub async fn artnet_task(
     info!(" ");
     info!("IP address: {:?}", local_addr);
     info!(" ");
-
-    let _ = tx_router.try_send(RouterEvent::StoreIpAddr(Some(local_addr)));
 
     // Lookup the mac address -- assumed to be the first 6 bytes of the micro UID
     // let uid = embassy_stm32::uid::uid();

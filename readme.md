@@ -61,6 +61,7 @@ Three ways to power a unit (see [rev2-power-tree.svg](../dmx_interface_dev_board
 | `common/` | any (`no_std` lib) | Target-agnostic core: event router, channels, shared buffers, settings model, menu field metadata, Art-Net/sACN parsing, Enttec framing, constants |
 | `host_tests/` | host PC | Unit tests that run `common` on the PC |
 | `dmx_console/` | host PC | Ratatui console: edit settings + live DMX monitor over the USB console port |
+| `xtask/` | host PC | Build helper behind `cargo uf2`: builds pico2 and writes the UF2 for BOOTSEL flashing |
 | `rp2040_dmx/` | RP2040 | Bench firmware for the Rev 1 board: DMX TX test, Enttec CDC test, **FT232R emulator** (`ftdi_test`) |
 | `nucleo/` | STM32H563ZI | **Frozen.** The previous generation; kept as the record of the `common` extraction |
 | `docs/` | — | Architecture, bring-up checklist, FT232RNL provisioning notes |
@@ -78,8 +79,8 @@ dependency**. A task signature naming `Spi<'static, …>` or carrying
 
 **Build from inside each crate's folder** so its `.cargo/config.toml` (target +
 runner) applies; `cargo build --workspace` is not supported (conflicting
-`critical-section` features). Build profiles live in the workspace root
-`Cargo.toml`.
+`critical-section` features). The one exception is `cargo uf2`, which runs from
+the repo root. Build profiles live in the workspace root `Cargo.toml`.
 
 ## pico2 firmware
 
@@ -142,14 +143,36 @@ product defaults: Ethernet **on**, DMX mode, 150 LEDs per port, backlight 200.
 
 ### Build / flash
 
+Two routes. **SWD with a probe** gives you the defmt log and is what the bench
+stages use; **UF2 over USB** needs nothing but a cable and is how a unit gets
+updated in the field.
+
 ```
+# --- UF2 over USB (from the repo root) -------------------------------------
+cargo uf2                        # builds pico2 --release, writes
+                                 #   target/thumbv8m.main-none-eabihf/release/pico2.uf2
+cargo uf2 --features usb         # the USB-logger variant -> pico2-usb.uf2
+cargo uf2 --no-build             # just convert the ELF already in target/ (whichever
+                                 #   variant was built last — it is written as pico2.uf2)
+# then: hold BOOTSEL on the module while plugging its USB-C into a PC; it
+# enumerates as a mass-storage drive (RP2350). Copy pico2.uf2 onto it — the
+# module flashes itself and reboots. No picotool, no probe.
+
+# --- SWD with a probe (from pico2/) ----------------------------------------
 cd pico2
 cargo build --release
-cargo run --release          # probe-rs over SWD (defmt logs at DEFMT_LOG=info)
+cargo run --release              # probe-rs over SWD (defmt logs at DEFMT_LOG=info)
 DEFMT_LOG=debug cargo run --release   # verbose bench session
-# USB instead of SWD: hold BOOTSEL, then
+# picotool over USB is still an option for the ELF:
 picotool load -u -v -x -t elf ../target/thumbv8m.main-none-eabihf/release/pico2
 ```
+
+`cargo uf2` is a workspace alias for the dependency-free `xtask` helper, which
+runs the pico2 build and converts the ELF's flash segments into RP2350
+(Arm, Secure) UF2 blocks, checking the IMAGE_DEF the bootrom requires is in
+the first 4 KB. Run it from the **repo root**: inside `pico2/` that crate's
+`.cargo/config.toml` forces the ARM target and the host tool cannot build.
+Its output has been byte-compared against `picotool uf2 convert`.
 
 ### Provisioning a new unit
 

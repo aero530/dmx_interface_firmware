@@ -37,6 +37,27 @@ use common::channels::{EepromChannelRx, RouterChannelTx};
 use common::event_router::RouterEvent;
 use common::events::EepromEvent;
 use common::ui::{BootStatus, MenuData, ModuleType};
+
+// # No priming writes
+//
+// Rev 1 preceded every EEPROM write with a throw-away byte write to the same
+// address — four of them, each commented "page write only works if you write a
+// byte to the device first ... the bus isn't properly cleared on other read /
+// write attempts". They were removed on 2026-09-16 after confirming saves
+// persist across power cycles without them.
+//
+// They were treating a symptom that this build cannot produce. `write_page`
+// puts the memory address and the data into **one** `i2c.write()`, and the
+// shared bus is an `I2cDevice` over a `Mutex`, which holds the lock for the
+// whole call — so the expander poll running every 20 ms on core 1 cannot
+// interleave between the address byte and the data, which is what "the address
+// not being transmitted" describes. Both `write_byte_wait` and
+// `write_page_wait` then ACK-poll until the write cycle completes, so back-to-
+// back writes are spaced by the part's own timing rather than by the accidental
+// ~5 ms that a priming write used to contribute.
+//
+// If a write ever fails again, look at those three properties before re-adding
+// a priming write: it never fixed anything, it only made the gap wider.
 use defmt::*;
 use embassy_time::{with_timeout, Duration};
 use embedded_hal_async::i2c::I2c;
@@ -176,7 +197,6 @@ impl<I2C: I2c> Eeprom<I2C> {
                 });
 
                 if length > 0 {
-                    let _ = self.dev.write_byte_wait(MODULE_TYPE_ADDR, slice[0]).await; // throw away write due to shared bus issues
                     match self.dev.write_byte_wait(MODULE_TYPE_ADDR, slice[0]).await {
                         Ok(_) => {
                             let _ = self.tx.try_send(RouterEvent::StoreModuleType(Some(module)));
@@ -208,13 +228,6 @@ impl<I2C: I2c> Eeprom<I2C> {
             EepromEvent::WriteMacAddress(mac) => {
                 info!("EEPROM Store mac {:?}", mac);
 
-                // There is something going on that makes it so page write only works if you write a byte to the device first then
-                // do the page write...something with the address not being transmitted. Not sure if this is something the eeprom
-                // is doing or something in the microcontroller or code.
-                //
-                // This problem appears to have something to do with using the shared bus...like the bus isn't properly cleared on other
-                // read / write attempts.
-                let _ = self.dev.write_byte_wait(MAC_ADDR_LOC, mac[0]).await;
                 match self.dev.write_page_wait(MAC_ADDR_LOC, &mac).await {
                     Ok(_) => {
                         let _ = self.tx.try_send(RouterEvent::StoreMacAddress(Some(mac)));
@@ -297,14 +310,6 @@ impl<I2C: I2c> Eeprom<I2C> {
                     // bincode decodes the struct prefix and stops.
                     let chunks = slice[..length].chunks(PAGE_SIZE as usize).enumerate();
 
-                    // There is something going on that makes it so page write only works if you write a byte to the device first then
-                    // do the page write...something with the address not being transmitted. Not sure if this is something the eeprom
-                    // is doing or something in the microcontroller or code.
-                    //
-                    // This problem appears to have something to do with using the shared bus...like the bus isn't properly cleared on other
-                    // read / write attempts.
-                    let _ = self.dev.write_byte_wait(SETTINGS_ADDR, slice[0]).await;
-
                     for (num, chunk) in chunks {
                         let mem_addr = SETTINGS_ADDR + (num as u8) * PAGE_SIZE;
                         // self.dev.write_page_wait(mem_addr, chunk).await;
@@ -353,7 +358,6 @@ impl<I2C: I2c> Eeprom<I2C> {
                 });
 
                 if length > 0 {
-                    let _ = self.dev.write_byte_wait(BOOT_FLAG_ADDR, slice[0]).await; // throw away write due to shared bus issues
                     match self.dev.write_byte_wait(BOOT_FLAG_ADDR, slice[0]).await {
                         Ok(_) => {
                             let _ = self.tx.try_send(RouterEvent::StoreBootStatus(Some(status)));
