@@ -165,6 +165,7 @@ pub async fn sacn_task(
             dmx_buffer[start..start + len].copy_from_slice(&packet.values[..len]);
         }
 
+        crate::netstats::sacn_stored();
         // Reported as a Port-Address with Net 0; the router skips the Net
         // filter in sACN mode.
         let _ = tx.try_send(DmxEvent::ArtNetPacket(PacketAddress::new(

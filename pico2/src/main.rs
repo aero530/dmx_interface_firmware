@@ -59,6 +59,8 @@ mod artnet;
 mod buttons;
 mod console_usb;
 mod diag;
+mod netstats;
+mod spi_coalesce;
 mod dmx;
 mod dmx_pio;
 mod eeprom;

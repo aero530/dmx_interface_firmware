@@ -37,21 +37,24 @@ use embassy_rp::gpio::{Input, Output};
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio_programs::spi::Spi as PioSpi;
 use embassy_rp::spi::Async;
-use embassy_time::{Delay, Timer};
-use embedded_hal_bus::spi::ExclusiveDevice;
+use embassy_time::Timer;
 
 /// PIO SPI bus to the W6300 — PIO0 state machine 0.
 pub type SpiBus = PioSpi<'static, PIO0, 0, Async>;
 
-/// `embedded-hal-async` SPI device: the bus plus a software chip select on
-/// GP16. The W6300 is alone on this bus, so exclusive access is exactly right.
-pub type SpiDev = ExclusiveDevice<SpiBus, Output<'static>, Delay>;
+/// The `SpiDevice` the driver talks through: the PIO bus plus the software
+/// chip select on GP16, with the header of every register access coalesced into
+/// one blocking burst and DMA kept for the frame payload alone. See
+/// `spi_coalesce.rs` for why that replaced `embedded_hal_bus`'s
+/// `ExclusiveDevice`, and the measurement behind it. The W6300 is alone on this
+/// bus, so exclusive ownership is exactly right.
+pub type SpiDev = crate::spi_coalesce::CoalescingSpi;
 
 /// Bus and chip select, kept apart until [`init`] has settled on a clock.
 ///
-/// The driver takes ownership of a whole `SpiDevice`, and `ExclusiveDevice`
-/// gives no way back to the bus inside it — so the clock has to be chosen
-/// before the two are joined.
+/// The driver takes ownership of a whole `SpiDevice`, and once the bus is
+/// inside one there is no way back to `set_frequency` — so the clock has to be
+/// chosen before the two are joined.
 pub struct SpiParts {
     pub bus: SpiBus,
     pub cs: Output<'static>,
@@ -144,12 +147,23 @@ const PROBE_READS: u32 = 16;
 /// by [`OPERATING_MAX_HZ`].
 pub const SPI_FREQ_HZ: u32 = PROBE_FREQS_HZ[0];
 
-/// Receive queue depth, in MACRAW frames.
+/// Receive queue depth, in MACRAW frames, between the driver and smoltcp.
 ///
-/// Sized for the burst shape rather than the average: a console pushes all its
-/// universes back-to-back at the top of each refresh, so ~32 frames can arrive
-/// in a clump at 44 Hz. The W6300's own 32 KB RX buffer absorbs most of that;
-/// this queue only has to keep the pipeline from stalling.
+/// The burst is absorbed by the chip, not here: socket 0 has the W6300 whole
+/// 16 KB (fix 1, vendored driver), about 28 full-size frames. This queue only
+/// carries frames the driver has already pulled over SPI to the point where
+/// `net_task` hands them to smoltcp.
+///
+/// 8 is the measured best, and 2 was tried (fix 5, 2026-09-16) on the theory
+/// that `net_task` was processing several queued frames per poll and the
+/// driver, woken by its payload DMA, sat behind that run. It was not: with 2
+/// slots the driver post-DMA wait was unchanged (216 -> 211 us), so the queue
+/// was already near one frame deep and the depth is not the lever. What 2 did
+/// add was episodic starvation - the driver blocking for a free slot - which
+/// widened frames-per-window from 30-31 to 27-33 and cost 4 % of throughput
+/// (1346 -> 1289/s). Reverted to 8. 4 was never tested; with no benefit to
+/// trade against there is nothing for it to buy. See docs/ARCHITECTURE.md
+/// section 11.
 pub const N_RX: usize = 8;
 /// Transmit queue depth. Only ArtPollReply and DHCP go out, so this is small.
 pub const N_TX: usize = 4;
@@ -269,14 +283,7 @@ pub async fn init(
         return None;
     }
 
-    let spi_dev = match ExclusiveDevice::new(parts.bus, parts.cs, Delay) {
-        Ok(d) => d,
-        Err(_) => {
-            error!("W6300: could not build the SPI device");
-            crate::diag::set(crate::diag::ETH_NO_REPLY);
-            return None;
-        }
-    };
+    let spi_dev = crate::spi_coalesce::CoalescingSpi::new(parts.bus, parts.cs);
 
     match embassy_net_wiznet::new(mac_addr, state, spi_dev, int, reset).await {
         Ok((device, runner)) => {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [ "common", "pico2", "rp2040_dmx", "xtask"]
+members = [ "common", "pico2", "rp2040_dmx", "xtask", "vendor/embassy-net-wiznet"]
 # dmx_console (PC tool) and host_tests (host-runnable firmware unit tests)
 # have their own dependency trees; keeping them out of the embedded
 # workspace keeps Cargo.lock clean. rp2040 is an empty placeholder crate,
@@ -25,6 +25,15 @@ members = [ "common", "pico2", "rp2040_dmx", "xtask"]
 # pico2 compiling against it. Delete once pico2 ships, or migrate if a deployed
 # STM32 unit ever needs patching.
 exclude = ["dmx_console", "host_tests", "nucleo", "rp2040"]
+
+# `embassy-net-wiznet` is vendored at 0.3.0 with one patch: the W6300 socket-0
+# RX buffer raised from 4 KB to the chip's full 16 KB, which needed sockets 1-7
+# zeroed and had no configuration path upstream. See
+# vendor/embassy-net-wiznet/PATCHES.md for the diff, the measurement behind it,
+# and the upstream status. Remove this patch and the member above when upstream
+# ships an equivalent.
+[patch.crates-io]
+embassy-net-wiznet = { path = "vendor/embassy-net-wiznet" }
 
 # Build profiles must be defined here: cargo silently ignores [profile.*]
 # sections in workspace member manifests (nucleo, rp2040_dmx, ...).

@@ -74,6 +74,11 @@ pub async fn artnet_task(
     // let mac_address_bytes = [mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]];
 
     // Then we can use it!
+    // 4 KB is enough here, and it was measured rather than assumed: raising it
+    // to 32 KB on 2026-09-16 changed ingest by 0 %. The burst absorber is the
+    // W6300's own RX memory, not this buffer - by the time packets reach the
+    // socket they arrive at the SPI drain rate, one every ~1-2 ms, and this task
+    // pulls them faster than that. See ARCHITECTURE.md section 11.
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
     let mut rx_meta = [PacketMetadata::EMPTY; 16];
@@ -121,9 +126,21 @@ pub async fn artnet_task(
             Ok(x) => x,
             Err(e) => {
                 error!("ArtNet socket receive error {:?}", e);
+                crate::netstats::artnet_error();
                 continue;
             }
         };
+        crate::netstats::artnet_rx();
+        // Fix 4 (docs/ARCHITECTURE.md section 11): hand the core back before
+        // touching the packet. When this task wakes, the W6300 driver has
+        // usually just finished a payload DMA and its wake is queued behind us;
+        // measured 2026-09-16, it waited 263 us per frame for the parse-lock-
+        // copy path below to run to completion. Yielding here lets that queued
+        // wake run first, splitting our per-packet work into two short pieces
+        // instead of one long one. `buf`, `len` and `from_addr` are ours, so
+        // nothing changes under us while we are away; the cost is one extra
+        // poll per packet, a microsecond or two at 1300 packets a second.
+        yield_now().await;
         // trace!("Ethernet {:?}", buf);
 
         match tiny_artnet::from_slice(&buf[..len]) {
@@ -138,6 +155,11 @@ pub async fn artnet_task(
 
                 // Only store data when ArtNet is the active input, otherwise stray
                 // network packets overwrite the wired-DMX / USB / sACN data.
+                if !input_mode.is_artnet() {
+                    // Arrived, deliberately not rendered: a mode change is a
+                    // reason to ignore traffic, not a reason to lose count of it.
+                    crate::netstats::artnet_ignored();
+                }
                 if input_mode.is_artnet() {
                     // Filter on Net *before* touching the buffer. The buffer is
                     // indexed by SubUni only, so a packet on another Net with a
@@ -150,6 +172,7 @@ pub async fn artnet_task(
                                 dmx.port_address.net, artnet_addr.0[0]
                             );
                         }
+                        crate::netstats::artnet_ignored();
                         continue;
                     }
                     // Index by the packet's SubUni byte (sub-net:universe) so
@@ -170,6 +193,7 @@ pub async fn artnet_task(
                             );
                             warned_out_of_range = true;
                         }
+                        crate::netstats::artnet_ignored();
                         continue;
                     }
                     let start = DMX_UNIVERSE_SIZE * sub_uni;
@@ -181,6 +205,7 @@ pub async fn artnet_task(
                     // info!("{}", dmx_buffer[start..end]);
 
                     // if dmx.port_address.universe == 2 {
+                    crate::netstats::artnet_stored();
                     let _ = tx.try_send(DmxEvent::ArtNetPacket(PacketAddress::new(dmx.port_address, dmx.sequence)));
                     // }
                 }
@@ -287,6 +312,7 @@ pub async fn artnet_task(
                 debug!("command {:?} - {:?}", command.esta_manufacturer_code, command.data);
             }
             Err(err) => {
+                crate::netstats::artnet_malformed();
                 // info!("Error: {:?}", err);
 
                 match err {

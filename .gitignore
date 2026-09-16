@@ -2,3 +2,10 @@
 ~*
 
 */target
+# Scratch firmware builds copied to the root for bench A/B tests (e.g. pico2-spi10mhz.uf2).
+# The real output lives under target/.
+/*.uf2
+
+# Logic-analyser / scope dumps dropped at the root for analysis (digital.csv is 70 MB).
+/*.csv
+__pycache__/

@@ -217,6 +217,12 @@ Remaining Stage 3 checks, now that the panel is lit:
 
 ## Stage 5 — Ethernet
 
+**Ports start on universe boundaries.** A port's first universe is the base plus the universes every *earlier* port consumes, and each port rounds up on its own (`universe_offset` / `universes_per_port` in `common/src/ui/types.rs`): `ceil(LEDs × bytes_per_LED / 512)`. With every port set to the strip it actually has — 64 RGB LEDs, 192 B, one universe each — the ports are consecutive from the base. Set `LEDs Port 1` to 600 instead and it claims 4 universes, so port 2 moves to base + 4. Worth knowing before deciding a port is dead: check the LED page before the wiring. Art-Net and sACN allocate identically.
+
+**Bench configuration these commands assume** (2026-09-16): **2 universes bound at base `0:0:1`**, i.e. `0:0:1` on port 1 and `0:0:2` on port 2, with **64 RGB LEDs per universe** (192 of 512 channels used). Pass `--leds 64` to `dmxsend.py` for anything with a visible pattern — its default walks all 170 pixels a universe can hold, so on a 64-LED strip the chase would spend most of its time past the end and the output would look dead.
+
+A rig with different strip lengths or a different bound count only changes `--count`, `--leds` and the base address; nothing below depends on the numbers being these.
+
 - ✓ DHCP (confirmed 2026-09-15): `ETH dhcp…` then the address on the title row; `info` → `net=Up(…)`. Link LED on the module RJ45. **Stuck on `ETH dhcp…` with `ip=0.0.0.0`** is two different faults — check `diag=` for `eth_link_up` before suspecting DHCP, because without it the PHY never negotiated and nothing was ever asked for.
 - ✓ Static: Network page → `IP Mode = Static`, set `Static IP`/`Prefix`; reboot; the title row shows that address, a PC on the same subnet pings it.
 - ✓ **Ping**, static and DHCP. Needs the `auto-icmp-echo-reply` feature on `embassy-net`: smoltcp 0.13 moved the automatic echo reply behind it, and it sits in smoltcp's *default* set which embassy-net disables, so it has to be asked for. Added 2026-09-16 — before that the node answered ARP, held a lease and passed Art-Net while ignoring every ping. If ping fails again, check `arp -a` on the PC first: an entry with the node's MAC means ARP works and the fault is ICMP (this feature); an incomplete entry means the frames are not arriving at all.
@@ -287,10 +293,135 @@ Remaining Stage 3 checks, now that the panel is lit:
   **`Univ Bound` on the Main page reads 17 to match, and tracks the LED-port settings as they change** (confirmed 2026-09-16). Discovery is done.
 
   **Close other Art-Net software first.** ArtNetominator, QLC+ and the rest hold UDP 6454 as well. The tool sets `SO_REUSEADDR` so it still binds, but Windows delivers each *unicast* datagram to only one listener — and the node's reply is unicast, back to whoever polled — so another app can silently swallow it and the tool reports nothing found. For a GUI view, **ArtNetominator** (free, Windows) does discovery and can send test DMX; it is the lighter option if QLC+ is more than the job needs.
-- [ ] Art-Net data: controller drives universe `net:sub:uni` → port 1 (J1) follows; universe +1 → port 2 (J3) (Individual mode, ≤ 170 RGB LEDs/port). A span crossing a sub-net boundary (base 0:0:14, 4-universe port) renders correctly.
-- [ ] Other-Net traffic (controller on Net 1, node on Net 0): ignored, one `ArtNet: ignoring traffic on Net` line, no storm.
-- [ ] **sACN**: mode `sACN`, `sACN Universe = 1`, controller on universe 1 → port 1; change the base to 100 → log shows the re-join with **32 of 32 groups joined** (fewer means smoltcp's multicast table is too small), universe 100 → port 1.
-- [ ] **Throughput ceiling** (Phase 0 measurement — record the number): first read `eth_hz=` from `info`, which is the clock the boot probe settled on and the hard ceiling on everything below it. Then flood 32 universes at 44 Hz and watch for dropped frames / `ArtNet socket receive error`. If `eth_hz` came back under 20000k, raising the top of `w6300::PROBE_FREQS_HZ` will not help — the limit is sample timing, and the fix is a PIO SPI that samples mid-bit rather than at the rising edge.
+- ✓ **Art-Net data** (confirmed 2026-09-16) — `python tools/dmxsend.py --target <node ip> --universe 0:0:1 --count 2 --leds 64 --pattern chase`. A white pixel walks each strip, starting 16 LEDs apart between the two so the ports are told apart at a glance. Port 1 (J1) follows `0:0:1`, port 2 (J3) follows `0:0:2`.
+  - Use `--target` rather than broadcast: that is what a real controller does once it has seen an ArtPollReply, and it is the path that matters.
+  - `--pattern solid --color 255,0,0 --leds 64` is the blunt version if a chase is hard to see — it lights exactly 64 pixels, so an LED 65 coming on means the port is configured for more than is connected.
+  - **Sub-net boundary**: set the node's Art-Net base to `0:0:15` and its 2 universes then span `0:0:15` and `0:1:0` — the boundary falls between them. Drive it with `--universe 0:0:15 --count 2 --leds 64`. Both must render. This is the case `artpoll.py` already showed the node *advertising* correctly (a bind cut short at universe 15); this checks it also *renders* correctly. Put the base back to `0:0:1` afterwards.
+- ✓ **Other-Net traffic** (confirmed 2026-09-16) — with the node on Net 0, run `python tools/dmxsend.py --target <node ip> --universe 1:0:1 --leds 64 --pattern solid`. The output must not change and the log must carry **one** `ArtNet: ignoring traffic on Net 1 (configured 0)` line, not one per packet at 44 Hz. The latch that guarantees that is `warned_other_net` in `artnet.rs`; it re-arms on a mode or address change, so switching pages and back should let it fire once more.
+- ✓ **sACN** — set mode `sACN` and `sACN Universe = 1`, then `python tools/dmxsend.py --protocol sacn --universe 1 --count 2 --leds 64 --pattern chase`. Ports 1 and 2 follow universes 1 and 2. Confirmed 2026-09-16 at base 1, and again after rebasing the node to 5 — the base always lands on port 1, so `sACN Universe = N` means "port 1 listens on N". sACN is multicast, so there is no `--target`; the tool sends to 239.255.0.1 and pins the outgoing interface, because Windows otherwise picks by routing table and can send it out a VPN or virtual adapter.
+  - Then change the base to 100. The log must show the re-join with **32 of 32 groups joined** — fewer means smoltcp's multicast table is back to its default of 4, i.e. the `iface-max-multicast-group-count-32` feature in `pico2/Cargo.toml` was lost.
+  - `--protocol sacn --universe 100 --count 2 --leds 64` then drives the re-based pair. Behind an IGMP-snooping switch this is the test that proves the joins reached the switch rather than only the stack.
+  - **Expect a pause of several seconds after a rebase before anything lights** — seen on the bench 2026-09-16 rebasing to 105, and it is the network rather than the node. `rejoin()` leaves 32 groups and joins 32 more with no awaits, so the firmware is done in microseconds and logs `sACN: universes N..M - joined 32 groups` straight away. The switch only starts forwarding the new groups once it has seen the IGMP membership reports and reprogrammed its snooping table, and one waiting on its querier interval can take tens of seconds. A pause that clears on its own is IGMP working as designed; one that never clears is a real failure. The log line tells you which side to look at.
+  - To exercise the whole 32-group window rather than just the two bound universes, `--universe 100 --count 32 --pattern ramp`. Only the bound pair renders; the point is that the joins hold and nothing is dropped or logged as an error.
+- ✓ **Throughput ceiling** — **closed 2026-09-16 at 30 of 32 back to back (95.6 %, 1346/s), 32 of
+  32 paced.** Started at 9 of 32 (439/s); five measured experiments, four kept; 32 back to back
+  is out of reach on this chip (both limits sit at 30; it would need ≤ 0.37 ms per frame during
+  the 1.5 ms arrival). Everything below is the record of how the number was found and moved.
+  (Phase 0 measurement — record the number). Read `eth_hz=` from `info` first: that is the clock the boot probe settled on and the hard ceiling on everything below it. Then:
+
+  `python tools/dmxsend.py --target <node ip> --universe 0:0:1 --count 32 --rate 44 --seconds 60 --pattern ramp`
+
+  **32 universes deliberately, not the 2 that are bound.** The receiver buffers every universe below `DMX_UNIVERSE_COUNT` whether or not a port renders it, so this loads the network path and the W6300 transport at the level the design is budgeted for, on a bench rig that only has two strips. Only ports 1 and 2 will light; that is expected.
+
+  Watch the node's log for `ArtNet socket receive error` and the UI for lost frames, and check the LED output on the two live ports stays smooth. The tool prints the achieved rate and the wire bandwidth at the end.
+  - **Result, 2026-09-16 — the node does not meet the design point, and the reason is measured.**
+    Full-size frames: **439/s of 1408 offered**. Two CS/SCK logic captures of the W6300 bus during
+    the flood (`digital.csv` in Art-Net mode, `dmx_digital.csv` in DMX mode; `python
+    tools/busscope.py <file>`) show **exactly 9 of every 32-frame burst survive, in both modes**:
+    the driver gives the chip's socket 0 a **4 KB** RX buffer — seven frames — plus ~2 read while
+    the burst is still arriving. The other 23 are discarded inside the W6300, and the driver then
+    idles 8–12 ms of every 22.7 ms with nothing to read. 9 × 44 = 396/s. That is why halving the
+    SPI clock (−13 %), bypassing the render (+12 %) and growing the socket buffer (0 %) all barely
+    moved it. The payload DMA itself is perfect: 228.7 µs against 228.8 µs of wire. Per-frame
+    time inside a burst is 1.02 ms with the render, 0.66 ms without — a tight distribution; the
+    earlier "6.96 ms p90" was inter-burst idle misattributed. Full account and fix order in §11 of
+    `docs/ARCHITECTURE.md`.
+  - **Fix 1 applied and confirmed 2026-09-16: chip RX buffer 4 → 16 KB**, in
+    `vendor/embassy-net-wiznet` (see its `PATCHES.md`). DMX mode: **497 → 1064/s**. Counted in fixed
+    22.7 ms windows (`busscope.py digital_03.csv --period-ms 22.7`): survivors **median 28, p90 and
+    max 30, min 15**. A burst landing on an empty buffer keeps 30 — 28 held plus 2 read during
+    arrival, the 16 KB prediction exactly — and the average is pulled down to 24 by **the sender**,
+    not the node: `dmxsend.py` was sleeping in Windows' 15.6 ms steps, so bursts landed in
+    pairs ~15 ms apart and the second of each pair found a half-drained buffer. Both tools are fixed
+    (1 ms timer + spin wait + a spacing report in `dmxsend.py`; `--period-ms` in `busscope.py`).
+    **Always read the sender's spacing block before reading the node's count.**
+  - **Re-tested with the fixed sender, 2026-09-16.** DMX mode (`digital_04.csv`): **29–30 per
+    22.7 ms window, every window; 1342/s**; per-frame 0.608 ms; regular 5.6 ms idle. Fix 1 confirmed
+    to the frame. Art-Net mode (`digital_05.csv`): **866/s, median 19 per window, 1.227 ms/frame,
+    zero idle** — and the driver's post-DMA wait is **434 µs against 43 µs in DMX mode**: the
+    per-packet LED rebuild costs 0.62 ms/frame. That is fix 2's target.
+  - **Fix 2 applied 2026-09-16: render on a 16 ms timer**, `pico2/src/event_router.rs` only (see
+    §11 of `docs/ARCHITECTURE.md`). **Test it** — Art-Net mode, then DMX mode once to confirm
+    nothing moved there, `stats` either side and a capture each:
+
+    `python tools/dmxsend.py --target <node ip> --universe 0:0:1 --count 32 --rate 44 --seconds 30 --pattern ramp`
+    `python tools/busscope.py <capture>.csv --period-ms 22.7`
+
+    **Measured (`digital_06.csv`): Art-Net 866 → 1150/s over 30 s; 29 per window in the capture
+    (28–31); per-frame 1.227 → 0.775 ms; tail 434 → 140 µs.** About 60 % of the predicted gain: at
+    0.775 ms the drain takes 22.5 of the 22.7 ms window, so it sits at the edge and jitter costs
+    whole bursts — the 30 s average (26/burst) comes in under the steady second the capture caught.
+    The rest of the gap to DMX mode is the Art-Net task's per-packet store path. Full account in §11.
+    Two things only eyes can check, still to do: the chase pattern is smooth (a 62.5 Hz tick renders
+    each 44 Hz frame exactly once), and there is now up to 16 ms between the first packet of a frame
+    and the LEDs — under one Art-Net frame; Stage 6 will see the same on wired DMX.
+  - **Fix 3 applied 2026-09-16: SPI round trips coalesced**, `pico2/src/spi_coalesce.rs` (see §11).
+    Every register access is now one blocking burst instead of four DMA round trips; only the payload
+    uses DMA. **Test it** — Art-Net mode, `stats` either side, and a capture:
+
+    `python tools/dmxsend.py --target <node ip> --universe 0:0:1 --count 32 --rate 44 --seconds 30 --pattern ramp`
+    `python tools/busscope.py <capture>.csv --period-ms 22.7`
+
+    **Measured (`digital_07.csv`): 1150 → 1304/s over 30 s (92.6 %); 30 per window (29–31); the
+    30 s figure now matches the capture** — the edge is cleared. Coalescing proven: sub-burst gaps
+    4.5 → 0.2 µs, header gaps at offsets 1/3 from 100 % of reads to 2 %, register phase
+    0.285 → 0.141 ms with p90 0.496 → 0.194. **Not predicted: the tail rose 140 → 263 µs** and
+    per-frame moved only 0.775 → 0.751 — the register phase is now blocking, so the other core-0
+    tasks run during the payload DMA instead and are mid-flight when it completes. The tail is now
+    35 % of a frame. Full account in §11. Still to do by eye: DMX mode once (~1342) and the LEDs
+    chasing.
+  - **Fix 4 applied 2026-09-16: `yield_now()` in the Art-Net task right after `recv_from`**
+    (`pico2/src/artnet.rs`, one line), so the driver — already woken by the payload DMA — runs
+    before the parse-lock-copy path. **Test it** — Art-Net mode, `stats` either side, and a capture:
+
+    `python tools/dmxsend.py --target <node ip> --universe 0:0:1 --count 32 --rate 44 --seconds 30 --pattern ramp`
+    `python tools/busscope.py <capture>.csv --period-ms 22.7`
+
+    **Measured (`digital_08.csv`): 1304 → 1346/s over 30 s (95.6 %) — equal to DMX mode; 30 per
+    window in every window (min 30, max 31); tail 263 → 216 µs.** So the Art-Net store path was
+    ~50 µs of the tail and the remaining ~216 µs is smoltcp in `net_task`. The ceiling is now
+    explicit: buffer + arrival = 28 + 2 = 30, drain = 22.7 ÷ 0.755 = 30.1 — both limits at 30. 32
+    back-to-back would need ≤ 0.37 ms/frame during the arrival, out of reach on this chip. **30–31
+    of 32 is the practical back-to-back ceiling; a paced controller has had 32 of 32 since fix 2.**
+    Full account in §11.
+  - **Fix 5 applied 2026-09-16: `N_RX` 8 → 2** (`pico2/src/w6300.rs`, one constant), so `net_task`
+    handles at most two frames per poll instead of up to eight. **Test it** — Art-Net mode, `stats`
+    either side, and a capture:
+
+    `python tools/dmxsend.py --target <node ip> --universe 0:0:1 --count 32 --rate 44 --seconds 30 --pattern ramp`
+    `python tools/busscope.py <capture>.csv --period-ms 22.7`
+
+    **Measured (`digital_09.csv`): tail 216 → 211 µs (unchanged); per window 27–33 (was 30–31
+    every window); `stats` 1346 → 1289/s. Reverted to 8.** Queue depth was not the lever —
+    `net_task` already handled about one frame per poll, so the ~210 µs tail is smoltcp's per-frame
+    work — and two slots added episodic starvation. 4 was not tried: with no benefit to trade against,
+    it has nothing to buy. **Reflash `pico2.uf2` to return the board to the measured-best build.**
+    Full account and the closing table in §11.
+  - **Recommendation for this item:** close at *30 of 32 back-to-back (95.6 %), 32 of 32 paced*, with
+    32 back-to-back recorded as out of reach on this chip rather than as a target. Started at 9.
+  - **Fix 2 next: per-frame under 0.7 ms** so all 32 drain inside 22.7 ms — render on a timer first
+    (removes ~0.36 ms/frame and the tail inflation), then coalesce the SPI round trips for margin.
+    Each as its own build; re-measure frames per burst with `busscope.py`, not just `stats`.
+  - **When re-measuring**, the number to watch is **frames per burst** (section E of `busscope.py`).
+    `stats` gives the rate; the burst count says which limit you are hitting — the buffer (flat at
+    ~9 regardless of frame speed) or the drain (rises as per-frame time falls).
+  - **Progress, Art-Net mode, 32 full universes at 44 Hz back to back:** start 9/window 439/s →
+    fix 1 (16 KB chip buffer) 19 / 866 → fix 2 (render on a timer) 29 / 1150 → fix 3 (SPI
+    coalescing) 30 / 1304 → fix 4 (yield after receive) **30 every window / 1346/s** → fix 5
+    (queue depth 2) 27–33 / 1289, reverted. **Recommended close: 30 of 32 back to back (95.6 %),
+    32 of 32 paced; 32 back to back is out of reach on this chip.**
+  - **Take the node's own count, not the sender's.** `dmxsend.py` can only report what it transmitted; a link dropping a few percent looks identical from that end. Run `stats` on the USB console **twice** — once before the flood and once after — and the second call prints the rate over the interval:
+
+    ```text
+    rx=84512 stored=84480
+    ignored=32 malformed=0 errors=0 sacn=0
+    since last: 60.2s  1404 rx/s  1404 stored/s
+    ```
+
+    32 universes at 44 Hz is **1408 packets/s**. `stored/s` at or near that means every frame landed. `errors` must be 0. `malformed` above 0 means bytes are being corrupted on the way in, which at this point would mean the SPI clock is too fast — see `eth_hz=`/`eth_max=` in `info`.
+  - **Read the sender's own numbers too.** If it reports frames sent late, the PC could not keep the rate and the shortfall is yours, not the node's. Baseline measured 2026-09-16 on `orbital-emu`: 32 universes at 44 Hz sustained exactly, 5.97 Mbit/s, zero late frames — confirmed against the node at 192.168.86.36.
+  - 5.97 Mbit/s is the real number to compare against §6 of `docs/ARCHITECTURE.md`, which budgets 6.5 Mbps for the 1800 B/port design point.
+  - If `eth_hz` came back under 20000k, raising the top of `w6300::PROBE_FREQS_HZ` will not help — the limit is sample timing, and the fix is a PIO SPI that samples mid-bit rather than at the rising edge.
 
 ## Stage 6 — Wired DMX
 

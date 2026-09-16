@@ -163,17 +163,19 @@ ceiling already below the 44 Hz Art-Net rate. Above roughly 2400 B/port the
 WS2812 protocol is the wall, not the link, **which makes QSPI insurance rather
 than a dependency**.
 
-**Measured, 2026-09-15:** the boot probe settled the transport at **12 MHz**,
-not the 20 MHz this table was drawn against — 20 and 16 MHz both failed the
-version read (see §11). Single-SPI MACRAW at 12 MHz realistically delivers
-6–9 Mbps against the 6.5 Mbps the 1800 B/port row needs, so **the design point
-still fits but the margin is thin**, and the row below it does not. Confirm with
-the Stage 7 flood before treating 600 LEDs/port as a supported configuration.
-This is the number QSPI buys back, and the first real argument for doing it.
-
-The ingest risk is *broadcast* Art-Net, not your own universes. Art-Net 4 pushes
-controllers to unicast, driven by ArtPollReply — which is why that packet being
-correct matters operationally and not just for spec compliance.
+**The budget above holds, with one stated caveat.** The transport runs at
+**20 MHz** (probe ceiling 24 MHz, derated for margin, §11), so the bandwidth
+this table assumes is on the wire. Ingest was 439 packets/s when the table was
+first checked against hardware and is **1346/s** after the work recorded in
+§11: 30 of every 32 frames from a controller that emits all its universes back
+to back in 1.5 ms (95.6 %), and **32 of 32 from one that paces them across the
+frame**, which is the common case. So 600 LEDs/port is supported as drawn; a
+deliberately back-to-back sender loses two frames in thirty-two, and that is a
+ceiling of the W6300's 16 KB and 0.23 ms of wire per frame, not of the
+firmware. None of it was the link clock — halving the SPI clock cost 13 % —
+and none of it would have been helped by QSPI. Above ~2400 B/port the WS2812
+protocol is the wall regardless, so the 4 MHz given up to SPI margin buys
+throughput the design cannot spend.
 
 ### Memory (RP2350 has 520 KB)
 
@@ -184,10 +186,15 @@ correct matters operationally and not just for spec compliance.
 | WS2812 PIO/DMA buffers | 19.2 KB |
 | Staging copy | 14.4 KB |
 | Heap: two Ratatui 35×11 cell buffers (30.8 KB, measured at 40 B/cell) + menu strings | 64 KB |
-| smoltcp + MACRAW RX | ~48 KB |
+| smoltcp + MACRAW RX (`N_RX` = 8 frames) | ~48 KB |
+| Art-Net UDP socket receive buffer | 32 KB |
 
-Comfortably inside 520 KB. flip-link guards core 0's stack; core 1's 16 KB
-static stack has no guard, hence the margin.
+**Measured 2026-09-16: `.bss` = 264,248 B (258 KB), `.data` 256 B, `.uninit` 1 KB**
+— about half of the 512 KB main SRAM (`memory.x`; SRAM8/9 add 8 KB more). That
+includes the 32 KB socket buffer, raised from 4 KB the same day because it held
+7.7 full-size Art-Net packets against a 32-packet burst (§11). There is room to
+raise `N_RX` the same way if the ingest work calls for it. flip-link guards core
+0's stack; core 1's 16 KB static stack has no guard, hence the margin.
 
 ### PIO — 9 state machines across 3 blocks
 
@@ -414,6 +421,303 @@ Behavioural limits worth knowing before they are mistaken for faults:
   are unaffected (the DMA completes exactly and the PIO stalls on a full FIFO
   until the next read). The fix is an async display path; not worth it unless
   the bench shows it.
+- **Ingest: from 9 of 32 frames per burst to 30, closed 2026-09-16.** The
+  node started this investigation taking **439 packets/s** of a 1408/s design
+  point (32 universes at 44 Hz) and ended it at **1346/s — 30 of every 32
+  back-to-back frames, 32 of 32 from a controller that paces its universes.**
+  The item is closed there; 32 back to back is out of reach on this chip. What
+  follows is the record, kept because four of its confident hypotheses were
+  wrong until a measurement said so. The first cause was the chip buffer
+  holding nine frames of a thirty-two-frame burst. Nine flood runs and two CS/SCK logic captures of the W6300
+  bus (`digital.csv` in Art-Net mode, `dmx_digital.csv` with the render
+  bypassed; analyse with `tools/busscope.py`) closed the question. What was
+  ruled out first:
+
+  | Suspect | Test | Verdict |
+  |---|---|---|
+  | SPI clock | halved to 10 MHz | 13 % slower on big frames, 2 % on small — not it |
+  | UDP socket buffer | 4 → 32 KB | **0 % change** — not it, reverted |
+  | Per-byte work in the read path | scope: gaps by byte offset | **none** — the 572-byte payload DMA is continuous, 228.7 µs against 228.8 µs of wire |
+  | A heavy tail of slow frames | scope, idle excluded | **none** — per-frame time is 1.02 ms median, 1.10 ms p90; an earlier draft's "6.96 ms p90" was inter-burst idle misattributed |
+
+  **What the captures show.** A controller emits its 32 universes back to back:
+  32 × 572 B lands in ~1.5 ms, then nothing for ~21 ms. The W6300 has 16 KB of
+  RX memory in total (`Sn_RX_BSR` takes 0/1/2/4/8/16 KB and the sum over all
+  sockets may not exceed 16 KB; WIZnet ioLibrary `w6300.h`), and
+  `embassy-net-wiznet` gives socket 0 **4 KB** (`Chip::BUF_SIZE = 0x1000`): seven
+  frames. The driver reads about two more while the burst is still arriving.
+  **Nine frames per burst survive, in both modes, every burst** — 8–9 with the
+  render running, 9–11 without — and 9 × 44 = 396/s. The other 23 are discarded
+  by the chip before the firmware ever sees them. The driver then **idles for
+  8–12 ms of every 22.7 ms** with nothing left to read.
+
+  That is why every earlier experiment moved the number so little. Halving the
+  clock, bypassing the render, growing the socket buffer: none of them changes
+  how many frames fit in 4 KB. Frame speed is nearly irrelevant while the
+  buffer discards three quarters of each burst.
+
+  **Per-frame cost, for when the buffer is fixed.** Inside a burst a frame takes
+  **1.02 ms with the render running, 0.66 ms without.** Anatomy of the
+  576-byte read: header 15 µs, payload 229 µs (perfect, continuous 20 MHz), then
+  **last SCK → CS-high 136–142 µs median** in *both* modes — executor latency
+  while the driver waits behind smoltcp and the Art-Net task's recv/parse,
+  which run regardless of mode. The render adds ~0.36 ms per frame, inflates
+  that tail's p90 from 177 to 680 µs, and roughly triples round-trip p99
+  (37 → 70 µs). The register phase is ~32 async DMA round trips at 4.6 µs
+  median across 7 transactions (up to 22 when `get_rx_size`'s
+  read-until-stable loop spins under load): ~0.24–0.32 ms.
+
+  **The design-point arithmetic.** A 32-frame full-size burst is 18.3 KB; the
+  chip's maximum for one socket is 16 KB, about 28 frames, plus whatever drains
+  during the 1.5 ms arrival. And all 32 must drain inside 22.7 ms: at 1.02 ms
+  that is 32.6 ms — **does not fit**; at 0.66 ms it is 21.1 ms — barely does.
+  So no single fix reaches 1408/s. Two classes are needed:
+
+  1. **Chip RX buffer 4 → 16 KB — APPLIED 2026-09-16**, in
+     `vendor/embassy-net-wiznet` via `[patch.crates-io]`; `PATCHES.md` there
+     has the diff and provenance. Upstream `main` (checked the same day) still
+     hard-codes `BUF_SIZE = 0x1000`, names only socket 0 and exposes nothing
+     configurable, so a version bump was not available; the patch is generic
+     (no-op hook on other chips) and a candidate to send upstream.
+
+     **Measured 2026-09-16, DMX mode (render bypassed): 497 → 1064/s, 2.1×.**
+     The capture (`digital_03.csv`) shows the buffer doing exactly what 16 KB
+     should — and it also caught a bug in the *measurement*. The driver now
+     drains continuously, and the bursts it sees arrive in pairs ~15 ms apart
+     followed by a long gap: `dmxsend.py` was scheduling with `time.sleep`,
+     which on Windows snaps to 15.6 ms steps, so a 44 Hz loop alternated
+     15.6 and 31.2 ms gaps that average 22.7. Counted in fixed 22.7 ms
+     windows (`busscope.py --period-ms 22.7`), survivors are **median 28,
+     p90 and max 30, min 15**: a burst landing on an empty buffer keeps 28 held
+     plus 2 read during arrival — the 16 KB prediction to the frame — and one
+     landing on a half-drained buffer keeps 15–16. Average 24, hence 1064/s. The tool now requests the 1 ms timer,
+     spins to its deadline, and prints its own frame spacing; `busscope.py`
+     gained `--period-ms` so the burst count no longer depends on drain
+     pauses. Two more things the capture measured: per-frame time inside a
+     burst rose 0.66 → 0.77 ms and round-trip latency doubled (4.6 → 11 µs),
+     because core 0 is now saturated with smoltcp work instead of idling half
+     the time — the drain is the ceiling from here on, which is what fix 2 is
+     for.
+
+     **Confirmed with the fixed sender, 2026-09-16** (`digital_04.csv`, DMX
+     mode): **29–30 frames per 22.7 ms window in every window** (min 29,
+     max 31), **1342/s**, per-frame 0.608 ms, and a regular **5.6 ms idle**
+     between bursts — that idle is the sender fix seen from the node's side,
+     and its regularity is why the merged-burst warning stayed silent.
+     Buffer-limited exactly where 16 KB says: 28 held plus ~2 read during the
+     1.5 ms arrival. The 2–3 lost per burst are the ones that do not fit.
+     Fix 1 is done. The original specification, kept for the record:
+
+     * `Chip::BUF_SIZE 0x1000 → 0x4000`. The driver writes `BUF_SIZE / 1024`
+       to `Sn_RX_BSR` and `Sn_TX_BSR`, so socket 0 gets 16 (KB), the maximum.
+     * **Zero sockets 1–7.** Their 2 KB defaults already sum to the 16 KB
+       limit, and the datasheet says the sum may not exceed it; over-committed
+       behaviour is undefined. Socket N's register block is `0x01 + 4N`
+       (0x05, 0x09, 0x0D, 0x11, 0x15, 0x19, 0x1D); `Sn_TX_BSR` is at `0x0200`
+       and `Sn_RX_BSR` at `0x0220` within it. Fourteen one-byte writes of `0`
+       in `WiznetDevice::new`, right after the socket-0 size writes at
+       `device.rs:107–109`. The `RegisterBlock` enum has no variant for those
+       blocks, so either add them or widen `Address` to `(u8, u16)`. ~25 lines.
+     * Verify with `busscope.py` section E: frames per burst should jump from 9
+       to the high twenties and *then* start tracking per-frame speed.
+
+     A fourth thing worth trying in the same copy, as an experiment and not a
+     claim: upstream ships the W6300 with **MAC filtering off**
+     (`SOCKET_MODE_VALUE = 0b0000_0111`, bit 7 clear) because DHCP failed with
+     it on. That means every frame on the wire — other hosts' broadcasts and
+     multicast — crosses the SPI and occupies the 16 KB before smoltcp discards
+     it. On a venue network that is real drain time and buffer space. The MAC
+     filter normally still passes broadcast, so the original DHCP failure may
+     have another cause; it is cheap to re-test with the filter on once the
+     buffer patch is in.
+  2. **Render on a timer, not per packet — APPLIED 2026-09-16, awaiting
+     measurement.** The Art-Net-mode baseline it must move, captured the same
+     day with the fixed sender (`digital_05.csv`): **866/s, 16–21 frames per
+     window (median 19), 1.227 ms per frame, zero idle** — purely
+     drain-limited. Against DMX mode's 0.608 ms, the per-packet render costs
+     **0.62 ms per frame**, and the capture shows where: the driver's wait
+     after each payload DMA is **434 µs median in Art-Net mode against 43 µs
+     in DMX mode** — it was queued behind a rebuild every time — plus
+     register-phase inflation (0.26 → 0.50 ms) and round-trip p99 90 µs
+     against 27. Half the Art-Net per-frame cost was the render.
+
+     The change is confined to `pico2/src/event_router.rs`, the embassy
+     wrapper: a DMX event no longer rebuilds, it is kept as the latest pending
+     event, and a 16 ms `Ticker` rebuilds at most once per period if anything
+     arrived. Coalescing is safe because the rebuild reads the *current*
+     `DMX_BUFFER`, already filled from every packet; other-Net traffic never
+     reaches the router. Trailing edge on purpose — a burst lands in 1.5 ms and
+     is rendered whole — at the cost of up to 16 ms added latency from first
+     packet to LEDs, under one Art-Net frame. 62.5 Hz sits above both the
+     44 Hz input and the 56 Hz strip ceiling, so no input frame is skipped and
+     no strip is starved. `common` is untouched; host tests unchanged.
+
+     **Measured 2026-09-16** (`digital_06.csv`, Art-Net mode): **866 →
+     1150/s** over 30 s; **29 per 22.7 ms window** in the 1 s capture (28–31);
+     per-frame **1.227 → 0.775 ms**; tail **434 → 140 µs**; register phase
+     0.502 → 0.285 ms; round-trip p99 90 → 42 µs. About 60 % of the predicted
+     gain, and the capture says why the rest is missing. At 0.775 ms, draining
+     29 frames takes **22.5 ms of a 22.7 ms window: the drain sits at the
+     edge.** Any jitter — a rebuild landing mid-burst, one slow round trip —
+     pushes a burst past the window, the next overflows 16 KB by more, and the
+     30 s average (26 per burst) comes in under the steady second the capture
+     caught (29). The residual 0.17 ms over DMX mode, and the 97 µs of extra
+     tail, are the Art-Net task's per-packet store path — the cross-core
+     `DMX_BUFFER` lock, a 512-byte copy, a channel send — which DMX mode skips,
+     plus the 62 Hz rebuild occasionally colliding with a drain. Fix 2 did its
+     job; it also made fix 3 necessary rather than optional.
+
+  3. **Coalesce the SPI round trips — APPLIED 2026-09-16, awaiting
+     measurement.** `pico2/src/spi_coalesce.rs` replaces
+     `embedded_hal_bus`'s `ExclusiveDevice` as the driver's `SpiDevice`: the
+     leading `Write`s of every transaction (block-select, address, dummy, and
+     the data of register writes) are gathered into one stack buffer and sent as
+     a single *blocking* burst — 6 bytes is 2.4 µs of wire, shorter than one
+     async round trip — any operation of 16 bytes or fewer goes blocking, and
+     DMA is kept for the payload alone. Each 4-`Operation` register access
+     becomes one transfer; a frame's ~32 round trips become ~2. It assumes
+     exclusive ownership of the bus, which the W6300 has. `common` untouched;
+     the vendored driver untouched (it only asks for `SPI: SpiDevice`).
+
+     **Measured 2026-09-16** (`digital_07.csv`, Art-Net mode): **1150 →
+     1304/s** over 30 s (92.6 % of offered), **30 per 22.7 ms window** (p10 30,
+     min 29, max 31), and the 30 s figure now matches the capture's 1328
+     headline — the edge is cleared. The mechanism is proven directly: the
+     gaps between sub-bursts of a register access went from **4.5 µs median to
+     0.2 µs** (a register access is now one continuous burst), the header
+     gaps at offsets 1 and 3 fell from 100 % of reads to ~2 %, and the register
+     phase went **0.285 → 0.141 ms** with its p90 collapsing 0.496 → 0.194.
+
+     **What was not predicted: the tail rose, 140 → 263 µs** (p90 367), and
+     ate most of the register-phase saving — per-frame moved only 0.775 →
+     0.751 ms. The explanation fits everything: the register phase is now
+     *blocking*, so the driver no longer yields during it. The other core-0
+     tasks — smoltcp, the Art-Net task's parse-lock-copy-send, the 62 Hz
+     rebuild — can only run during the payload DMA, and so they are mid-flight
+     when it completes. Same work, concentrated into the one window where the
+     driver is waiting. The 13 % throughput gain came from the variance
+     reduction, not the mean. The tail is now the single largest component of a
+     frame: **263 of 751 µs.**
+
+     Two residual stalls inside each read are explained and small. At byte
+     offset 4, ~10 µs: the hand-off from the blocking header to the payload
+     DMA. At offset 9, ~6.5 µs in 99.6 % of reads: `embassy-rp`'s
+     `transfer_inner` arms the TX DMA before the RX DMA (`join(tx, rx)`), the
+     FIFOs are 4 deep and unjoined, so the state machine shifts ~5 bytes, fills
+     the RX FIFO, and stalls on autopush until the RX DMA is armed a few
+     microseconds later. An upstream arming-order detail; not worth a fork.
+
+  4. **Yield in the Art-Net task after `recv_from` — APPLIED 2026-09-16,
+     awaiting measurement.** One line in `pico2/src/artnet.rs`: a
+     `yield_now().await` immediately after the receive returns. When that task
+     wakes, the W6300 driver has usually just finished a payload DMA and its
+     wake is queued behind it; yielding hands the core to the driver first and
+     splits the task's per-packet work into two short pieces instead of one
+     long one. `buf`, `len` and `from_addr` are the task's own, so nothing
+     changes under it while it is away; the cost is one extra poll per packet.
+
+     **Measured 2026-09-16** (`digital_08.csv`, Art-Net mode): **1304 →
+     1346/s** over 30 s (95.6 % of offered) — which is DMX mode's 1342: Art-Net
+     mode has caught the render-free case, so everything above smoltcp is now
+     hidden behind the drain. **30 per window in every window** (p10 30, p90
+     30, min 30, max 31); the floor rose from 29. Tail **263 → 216 µs**;
+     per-frame 0.755 ms; register phase and sub-burst gaps unchanged, as they
+     should be. The gain came as variance again: a higher floor lifted the 30 s
+     average while the 1 s headline barely moved.
+
+     The tail reading pins the split that the caveat above left open: the
+     Art-Net task's store path was **~50 µs** of the 263; the other **~216 µs
+     is smoltcp's per-poll processing in `net_task`**, which no yield in the
+     Art-Net task can reach. That is now the largest component of a frame,
+     29 % of it.
+
+     **The ceiling, legibly.** Frames surviving a back-to-back burst =
+     min(buffer + frames read during the 1.5 ms arrival, drain per 22.7 ms
+     window) = min(28 + 2, 22.7 ÷ 0.755 = 30.1). **Both limits sit at 30.**
+     Reaching 32 back to back needs *both* per-frame ≤ 0.71 ms (near) *and*
+     ~4 frames read during the arrival, i.e. ≤ 0.37 ms per frame — not
+     reachable on this chip, whose payload alone is 0.23 ms of wire and whose
+     16 KB is the maximum a socket may have. **30–31 of 32 is the practical
+     ceiling for a sender that emits all its universes back to back. A
+     controller that paces them across the frame has had 32 of 32 since
+     fix 2.** The 31st frame is plausibly one cheap experiment away:
+
+  5. **`N_RX` 8 → 2 — APPLIED 2026-09-16, awaiting measurement.** The
+     driver-to-stack channel held 8 frames, so `net_task`'s poll could process
+     up to eight before yielding — a run-to-completion segment the driver, woken
+     by its payload DMA, sat queued behind: the ~216 µs tail left after fix 4.
+     At 2 the segment is at most two frames. One constant in
+     `pico2/src/w6300.rs`; the chip's 16 KB does the buffering, so nothing is
+     lost. The trade-off is that the driver may briefly wait for a free slot
+     when smoltcp is behind, but that wait is itself a yield.
+
+     **Measured 2026-09-16 (`digital_09.csv`) — a null result, and
+     reverted.** Tail **216 → 211 µs: unchanged.** Per-frame, register phase
+     and data window all unchanged. So the queue depth was never the lever:
+     `net_task` was already handling about one frame per poll, and the ~210 µs
+     the driver waits after each payload DMA is smoltcp's work *per frame* —
+     parse, the 530-byte checksum, the copy into the socket buffer, its
+     socket-poll bookkeeping — not a multi-frame segment. What two slots *did*
+     add was episodic starvation: the driver occasionally blocked for a free
+     slot, a window dropped to 27–28, the next caught up to 32–33, and the
+     spread widened from 30–31 to **27–33** while `stats` fell **1346 →
+     1289/s**. Reverted to **8**, the measured best. The plan said 4 as a
+     compromise; a compromise trades a benefit against a cost, and there was
+     no benefit — 4 was not tested and has nothing to buy.
+
+     The null result is informative: it rules out queue depth and localises
+     the remaining tail to per-frame stack work. Levers that remain, for the
+     record and not recommended now: smoltcp's UDP receive checksum set to
+     `Ignored` (the Ethernet FCS already protects the frame; ~7 µs); fewer
+     open sockets to shorten smoltcp's poll; arming RX before TX in
+     `embassy-rp`'s `transfer_inner` to remove the ~7 µs offset-9 stall. Each
+     is single-digit microseconds or uncertain, against a ceiling that the
+     arithmetic says is 30–31 back to back regardless.
+
+     **Where the ingest work ends.** Art-Net mode, 32 full universes at 44 Hz
+     emitted back to back:
+
+     | Build | per window | `stats` (30 s) |
+     |---|---|---|
+     | Start | 9 | 439/s |
+     | Fix 1 — chip buffer 4 → 16 KB | 19 | 866/s |
+     | Fix 2 — render on a 16 ms timer | 29 | 1150/s |
+     | Fix 3 — SPI round trips coalesced | 30 | 1304/s |
+     | Fix 4 — yield after receive | **30, every window** | **1346/s** |
+     | Fix 5 — queue depth 2 | 27–33 | 1289/s — reverted |
+
+     3.1× from the start, 95.6 % of offered, Art-Net mode equal to DMX mode.
+     Both remaining limits — buffer plus arrival, and drain per window — sit
+     at 30, and 32 back to back needs ≤ 0.37 ms per frame during the arrival,
+     which this chip cannot do. **Closed 2026-09-16 at *30 of 32 back to back
+     (95.6 %), 32 of 32 paced*.** The levers left on the table — the UDP
+     receive checksum, socket count, RX-first DMA arming — are each a few
+     microseconds against a ceiling the arithmetic fixes at 30–31; if the last
+     frame ever matters, start there and measure with `busscope.py`.
+
+     **Recommendation:** close the throughput item at *30 of 32 back to back
+     (95.6 %), 32 of 32 paced*, run fix 5 only if the 31st frame is worth a
+     build, and treat 32 back to back as out of reach on this chip rather than
+     as a target. The node started this investigation at 9 of 32.
+
+     **On the remaining 1–2 frames.** `dmxsend.py` is deliberately worst-case:
+     32 full universes back to back in 1.5 ms. A controller that spaces its
+     universes across the 22.7 ms frame never presents that burst, and for it
+     the node has been at 32 of 32 since fix 2. Whether 30–31 of 32 under the
+     worst case is the design point, or 32 is, is a product decision the
+     measurements can now inform rather than guess at.
+
+  Each goes in as its own build and is measured with the same two
+  `tools/dmxsend.py` runs, `stats`, and a `busscope.py` capture — frames per
+  burst is the number that matters now. Four of this investigation's confident
+  hypotheses were wrong until a measurement said so; the burst count was the
+  one that explained all the others.
+
+  Two smaller notes. A sender that spaces its universes across the frame period
+  rather than emitting them back to back will fare much better than these
+  worst-case numbers; `dmxsend.py` is deliberately worst-case. And the tail
+  median of ~140 µs per frame is smoltcp checksum/copy plus the Art-Net task,
+  reducible by yielding inside them, but it is third-order until 1 and 2 land.
 - **The W6300 SPI clock is measured at boot, and then deliberately derated.**
   The PIO SPI latches MISO at the rising edge of SCK; the W6300 presents each
   bit on the preceding falling edge. A read is correct only while the SCK half

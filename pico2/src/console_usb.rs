@@ -9,6 +9,9 @@
 //! dmx <start> <count>  -> "dmx <ch> v v v ..." lines (16 per line) from the active
 //!                         input's universe, in that mode's addressing, then ok
 //! info                 -> mode/module/ip/mac/net/boot/diag summary, then ok
+//! stats -> Art-Net / sACN ingest counters, and the rate since the last call.
+//!     Two calls a known time apart is the throughput measurement; a sender
+//!     can only report what it transmitted.
 //! mac [xx:xx:xx:xx:xx:xx|clear] -> show, program, or clear the MAC. Any
 //!     unicast address is accepted; `clear` reverts to the built-in one
 //!     derived from the chip ID. Both take effect at the next boot.
@@ -125,6 +128,44 @@ async fn respond(class: &mut UsbClass<'_>, text: &str) -> Result<(), EndpointErr
 fn current(global_rx: &mut GlobalDataChannelRx) -> GlobalData {
     global_rx.try_get().unwrap_or_default()
 }
+
+/// Previous `stats` call, so the command can report a rate rather than a
+/// running total. Plain atomics rather than a mutex: the console is the only
+/// writer, and a torn read would cost one wrong rate line, not correctness.
+///
+/// Milliseconds are held in a `u32` because thumbv8m has no 64-bit atomics.
+/// That wraps every 49.7 days; `wrapping_sub` gives the right interval across
+/// the wrap for any two calls less than that apart, which is every pair of
+/// calls anyone will ever make.
+struct LastStats {
+    at_ms: core::sync::atomic::AtomicU32,
+    valid: core::sync::atomic::AtomicBool,
+    rx: core::sync::atomic::AtomicU32,
+    stored: core::sync::atomic::AtomicU32,
+}
+
+impl LastStats {
+    fn load(&self) -> (Option<u32>, u32, u32) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let at = self.valid.load(Relaxed).then(|| self.at_ms.load(Relaxed));
+        (at, self.rx.load(Relaxed), self.stored.load(Relaxed))
+    }
+
+    fn store(&self, at_ms: u32, rx: u32, stored: u32) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.at_ms.store(at_ms, Relaxed);
+        self.rx.store(rx, Relaxed);
+        self.stored.store(stored, Relaxed);
+        self.valid.store(true, Relaxed);
+    }
+}
+
+static LAST_STATS: LastStats = LastStats {
+    at_ms: core::sync::atomic::AtomicU32::new(0),
+    valid: core::sync::atomic::AtomicBool::new(false),
+    rx: core::sync::atomic::AtomicU32::new(0),
+    stored: core::sync::atomic::AtomicU32::new(0),
+};
 
 fn mac_text(mac: Option<[u8; 6]>) -> alloc::string::String {
     match mac {
@@ -262,6 +303,43 @@ async fn handle_line(
             },
         },
 
+        "stats" => {
+            // Ingest counters, plus a rate measured against the previous call.
+            // Two calls a known time apart is the actual throughput
+            // measurement: the sender can only report what it transmitted.
+            let c = crate::netstats::counts();
+            let now_ms = embassy_time::Instant::now().as_millis() as u32;
+            let (last_at, last_rx, last_stored) = LAST_STATS.load();
+            respond(class, &format!("rx={} stored={}\n", c.rx, c.stored)).await?;
+            respond(
+                class,
+                &format!(
+                    "ignored={} malformed={} errors={} sacn={}\n",
+                    c.ignored, c.malformed, c.errors, c.sacn
+                ),
+            )
+            .await?;
+            if let Some(at) = last_at {
+                let secs = now_ms.wrapping_sub(at) as f32 / 1000.0;
+                if secs >= 0.2 {
+                    respond(
+                        class,
+                        &format!(
+                            "since last: {:.1}s  {:.0} rx/s  {:.0} stored/s\n",
+                            secs,
+                            (c.rx.wrapping_sub(last_rx)) as f32 / secs,
+                            (c.stored.wrapping_sub(last_stored)) as f32 / secs
+                        ),
+                    )
+                    .await?;
+                }
+            } else {
+                respond(class, "since last: (run `stats` again to get a rate)\n").await?;
+            }
+            LAST_STATS.store(now_ms, c.rx, c.stored);
+            respond(class, "ok\n").await?;
+        }
+
         "provision" => {
             // Fresh-EEPROM bring-up: the liveness byte the boot gate reads, and
             // the settings blob (which stamps the schema version). The MAC is
@@ -274,7 +352,7 @@ async fn handle_line(
         }
 
         "help" => {
-            respond(class, "get | set <key> <value> | dmx <start> <count> | info | mac [xx:xx:xx:xx:xx:xx|clear] | provision\n").await?;
+            respond(class, "get | set <key> <value> | dmx <start> <count> | info | stats | mac [xx:xx:xx:xx:xx:xx|clear] | provision\n").await?;
             respond(class, "ok\n").await?;
         }
 
