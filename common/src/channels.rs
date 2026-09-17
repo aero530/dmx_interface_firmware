@@ -50,8 +50,11 @@ pub type UiChannelTx = Sender<'static, CriticalSectionRawMutex, UiEvent, 4>;
 /// is not silently dropped.
 pub static CHANNEL_UI: UiChannel = Channel::new();
 
-pub type GlobalDataChannel = Watch<CriticalSectionRawMutex, GlobalData, 2>;
-pub type GlobalDataChannelRx = WatchReceiver<'static, CriticalSectionRawMutex, GlobalData, 2>;
+// Three receivers: the USB console, the USB identity watch, and one spare. A
+// `Watch` hands out a fixed number and `receiver()` returns `None` past it, so
+// this is the ceiling on how many tasks can observe global state.
+pub type GlobalDataChannel = Watch<CriticalSectionRawMutex, GlobalData, 3>;
+pub type GlobalDataChannelRx = WatchReceiver<'static, CriticalSectionRawMutex, GlobalData, 3>;
 /// Router -> observers: broadcast of the router's `GlobalData` (settings,
 /// module type, MAC, boot status) after every store. Consumed by the USB
 /// console task.

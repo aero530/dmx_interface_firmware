@@ -30,6 +30,17 @@ eight WS2812 strings:
                        8 strings, ≤ 600 RGB / 450 RGBW each
 ```
 
+Both USB paths run the same widget: `enttec_widget.rs` is transport-agnostic, and
+only the bytes' route differs. **On the first build U2 (FT232RNL) is not fitted —
+the part could not be sourced — so the module's own USB carries `USB>DMX`, and it
+changes identity to do it.** QLC+ and other FTDI-discovering software cannot see a
+CDC port at all, so in `USB>DMX` mode the module enumerates as an FT232R
+(`ftdi.rs`: `0403:6001`, `ENTTEC` / `DMX USB PRO`, vendor class, status bytes on
+every IN packet); in every other mode it is the composite CDC device with the
+console. The identity is chosen at boot from the stored mode, so switching across
+that boundary needs a reboot. This is scaffolding for a board without U2: where the
+chip is fitted the identity comes from its EEPROM and `ftdi.rs` is unused.
+
 Settings live on a 172×320 TFT menu, a USB console, and an on-board EEPROM.
 
 The hardware is two boards: a **logic board** carrying the module, the isolated

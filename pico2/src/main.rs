@@ -59,6 +59,7 @@ mod artnet;
 mod buttons;
 mod console_usb;
 mod diag;
+mod ftdi;
 mod netstats;
 mod spi_coalesce;
 mod dmx;
@@ -331,6 +332,9 @@ async fn boot_task(
                 let _ = ee.write_byte_wait(eeprom::BOOT_FAIL_COUNT_ADDR, 0).await;
             }
             info!("boot: complete");
+            // Only now may the USB identity watcher reset the board; see
+            // `usb_device::usb_identity_watch_task`.
+            usb_device::mark_boot_complete();
             return;
         }
         error!("boot: success flag write attempt {} not confirmed", attempt);
@@ -341,6 +345,8 @@ async fn boot_task(
     // documented guard behaviour.
     error!("boot: flag could not be stored - EEPROM unreachable? Continuing with output enabled.");
     let _ = channels::CHANNEL.try_send(RouterEvent::StoreBootStatus(Some(BootStatus::Success)));
+    // This boot did finish, whatever the EEPROM thinks.
+    usb_device::mark_boot_complete();
 }
 
 /// Network bring-up: W6300 reset, MAC from the EEPROM, DHCP or the configured
@@ -612,6 +618,11 @@ fn main() -> ! {
         // widget plus the console line protocol `dmx_console` talks to. An
         // input like the network, so it sits alongside it rather than
         // competing with the UI on core 1.
+        // Reboots the board when the stored mode needs the other USB identity;
+        // see `usb_device::usb_identity_watch_task`.
+        s.spawn(unwrap!(usb_device::usb_identity_watch_task(unwrap!(
+            channels::CHANNEL_LOG.receiver()
+        ))));
         s.spawn(unwrap!(usb_device::usb_device_task(
             UsbDriver::new(p.USB, Irqs),
             channels::CHANNEL_DMX.sender(),

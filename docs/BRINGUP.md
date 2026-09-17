@@ -427,7 +427,7 @@ A rig with different strip lengths or a different bound count only changes `--co
 
 - [ ] Receive: console into **J5** (male XLR, "Input"), DMX mode → `dmx 1 16` on the console tracks the faders; log `DMX: receiving`. Unplug → `DMX: no data` within 1 s; replug → `signal restored`.
 - [ ] Alternate start codes (RDM traffic from the console) do not disturb channel values.
-- [ ] Scope GP9 (U1 pin 12, → R9 → U3) and GP10 (U1 pin 14, → R12 → Q1) in `USB>DMX` with QLC+ on the FTDI port: GP10 **high** while transmitting (Q1 on, U7 LED off), low in every other mode; DMX out on **J15** (female XLR, "Output") drives a fixture; BREAK 176 µs, MAB 16 µs, ~43 packets/s.
+- [ ] Scope GP9 (U1 pin 12, → R9 → U3) and GP10 (U1 pin 14, → R12 → Q1) in `USB>DMX`, driven from the **module’s native USB** widget port — U2 is not fitted, see Stage 8: GP10 **high** while transmitting (Q1 on, U7 LED off), low in every other mode; DMX out on **J15** (female XLR, "Output") drives a fixture; BREAK 176 µs, MAB 16 µs, ~43 packets/s. `ArtNet>DMX` exercises the same transmit path with no USB host at all (`tools/dmxsend.py`), so it is the simpler first check and isolates the driver from the widget.
 - [ ] `ArtNet>DMX`: the configured Art-Net universe appears on J15.
 - [ ] Undriven state: with the module removed, U4's driver is **disabled** (fail-safe receive: R1 biases the U7 LED on, DE/RE pulled low through the opto).
 - [ ] Isolation: `3V3ISO` to `GND` still open with the bus connected; no ground current through the XLR shield (CHGND → R4 → GND only).
@@ -456,17 +456,78 @@ A rig with different strip lengths or a different bound count only changes `--co
 
 ## Stage 8 — USB
 
+**U2 (FT232RNL) is not fitted** — the part could not be sourced (2026-09-16). Three things
+follow, and they are not the same thing:
+
+* **The FTDI *data* path is blocked** and is marked so below: J2 enumeration, the EEPROM
+  identity in [ft232rnl-eeprom.md](ft232rnl-eeprom.md), baud hunting on UART0, and verifying
+  the JP1/JP2 straps against live traffic. Set the straps now anyway so the board is ready.
+* **The J2 *power* path is unaffected.** The USB-C connector, R22/R23 CC resistors, D4, F1,
+  U14 and the LED-power switching involve no U2 at all, so every brick-on-J2 test below is
+  testable today and worth doing — it is most of Stage 8 by count.
+* **The Enttec widget is not blocked, and the module’s own USB is the interface `USB>DMX`
+  uses.** The widget is transport-agnostic in the firmware (`enttec_widget.rs`); what changed
+  on 2026-09-16 is that the module’s USB now **enumerates differently depending on the stored
+  mode**, because a CDC port is invisible to QLC+ and that was confirmed on the bench:
+
+  | Stored mode | The PC sees | Console |
+  |---|---|---|
+  | `USB>DMX` | an **FT232R**, `0403:6001`, `ENTTEC` / `DMX USB PRO` (`ftdi.rs`) | none |
+  | anything else | composite CDC: widget, console (, logger) | yes |
+
+  Changing between those two means re-enumerating, and **the board reboots itself to do it**
+  (`usb_identity_watch_task`, 2026-09-17): change the mode, the panel stays up for ~750 ms, the
+  board restarts and comes back with the right identity. It only fires when crossing the
+  `USB>DMX` boundary, and only once boot has completed and the EEPROM has confirmed the write —
+  resetting earlier would count against the Ethernet lockout guard, and a failed write simply
+  leaves the board as it was rather than looping.
+
+Two firmware notes while U2 is absent. GP13 (UART0 RX) floats with nothing driving it, so the
+baud-hunt loop in `enttec_uart.rs` may log `nothing framed, trying N baud` on line noise —
+harmless, and a one-line guard if it gets tiresome. And `FTDI widget: locked at … baud` will
+never appear: correct, not a fault.
+
+FTDI emulation (`pico2/src/ftdi.rs`, 2026-09-16) is a vendor-class interface, not a VID/PID
+change: `bcdDevice` = `0x0600` so the host knows which chip to drive, two status bytes in front
+of every IN packet, and the vendor control requests answered. It is **test scaffolding, not the
+product path** — on a board with U2 fitted the identity comes from that chip’s EEPROM and this
+module is unused — and it claims FTDI’s vendor ID, which is legitimate for real silicon and a
+decision to revisit if a unit ever ships without any.
+
+One upside worth knowing: where Windows has FTDI’s VCP driver installed (usually alongside
+D2XX), an FTDI device also appears as a COM port. So in `USB>DMX` mode QLC+ should find it
+through D2XX *and* xLights / OLA `usbpro` should find the COM port — strictly better reach than
+the CDC port had, at the cost of our own console.
+
+
 - [ ] **Identity**: `info` on the console shows a MAC of `02:44:4D:xx:xx:xx` when none is programmed, and the USB serial (Device Manager / `lsusb -v`) is 16 hex digits — **different on every unit**. Two units on one PC must enumerate as two COM ports.
-- [ ] **FTDI straps**: JP1 and JP2 both bridged **1-2** = straight (U2 TXD ← `FTDI.TX` net → GP13; U2 RXD ← `FTDI.RX` net ← GP28). 2-3 on both swaps TX/RX if a board is wired the other way round — never mix.
-- [ ] Module USB-C on a PC: two (three with the `usb` feature) CDC ports enumerate; port order = Enttec widget, console (, logger). `dmx_console` connects on the second.
-- [ ] Enttec widget over CDC: QLC+ **cannot** see it (expected — FTDI-only stack); xLights/OLA `usbpro` on the serial port can.
-- [ ] **FTDI port (J2)**: after programming U2 per [ft232rnl-eeprom.md](ft232rnl-eeprom.md), Windows shows `ENTTEC` / `DMX USB PRO`; QLC+ lists a DMX USB Pro; log `FTDI widget: locked at 250000 baud`; faders drive the LEDs in `USB>DMX` mode.
-- [ ] With the box **unpowered**, plugging J2 into a PC does nothing (U2 `RESET#` follows VBUS through R24/R25 and U2 is self-powered from 3V3: no enumeration, no back-drive). With the box powered, it enumerates.
-- [ ] Baud hunting: open the port at 57600 with a Python Enttec script → `locked at 57600 baud`.
+- [ ] **FTDI straps** — *set now, verify when U2 arrives.* JP1 and JP2 both bridged **1-2** = straight (U2 TXD ← `FTDI.TX` net → GP13; U2 RXD ← `FTDI.RX` net ← GP28). 2-3 on both swaps TX/RX if a board is wired the other way round — never mix.
+- [ ] Module USB-C on a PC: two (three with the `usb` feature) CDC ports enumerate; port order = Enttec widget, console (, logger). `dmx_console` connects on the second. With U2 unfitted this is the board’s only USB data port.
+- [ ] **Console fixture patch — the thing that will look like a firmware bug and is not.** The board
+  maps **raw DMX channels** to LED components, three per pixel, with no concept of a fixture. A console
+  patched with a fixture whose definition is not exactly 3 channels of R, G, B shifts every pixel after
+  the first, and the fixture's other channels land on LED components at apparently random places. An
+  RGBW definition is the classic: it claims 4 channels per pixel, so its *white* fader drives the next
+  pixel's *red*. Seen on the bench 2026-09-17 — QLC+ behaved correctly with no fixtures patched and
+  erratically with them. Patch 3 channels per pixel in R, G, B order starting at address 1, and use the
+  console's own DMX monitor to confirm fader N moves channel N before suspecting the board.
+  `tools/enttec.py --map 12` is the reference: it drives known channels with no console in the loop.
+- ✓ **Automatic re-enumeration** (2026-09-17). Change the mode into `USB>DMX` and out again. Each crossing reboots the board after ~750 ms and it comes back as the other device; changes that do not cross the boundary (`DMX` ↔ `ArtNet`, say) must **not** reboot. After two crossings in a row, `info` must still show `boot=Some(Success)` and Ethernet must still come up — that is the lockout guard staying clear.
+- [ ] **Widget in a non-`USB>DMX` mode (CDC).** The widget interface enumerates and answers `GET_PARAMS` / `GET_SERIAL`, but `OUTPUT_DMX` is refused by design (`enttec_widget.rs`) so a PC left plugged in cannot overwrite live wired-DMX or Art-Net data. Console and logger are on the second and third ports as before.
+- ✓ **`USB>DMX` mode: the board enumerates as an FT232R** (2026-09-17). Windows binds the FTDI driver and the VCP layer gives it a COM port; `tools/enttec.py --port COMn --params` round-trips `GET_PARAMS` (firmware 1.44, break 16, MAB 2, refresh 40 Hz), which exercises the bulk IN path including the two status bytes, and `--map 12` gives red/green/blue per pixel in the correct order. **The widget, the FTDI transport and the channel mapping are proven** — anything anomalous from a lighting console is that console's patch, not the board. `tools/enttec.py --pattern chase` is the known-good sender to compare against.
+- [ ] **`USB>DMX` output on J15.** The widget and the LED path are proven above; what is not is the wired output in this mode. Covered by the GP9/GP10 scope check in Stage 6 — do it there, with a fixture on J15. If Windows ever shows a driver error instead of an FTDI device, FTDI's driver is missing: install it from FTDI rather than from Windows Update's generic list.
+  - Faders in QLC+ drive the LEDs, and `USB>DMX` output appears on **J15**.
+  - If QLC+ enumerates it but reads fail, the likely culprit is the EEPROM read request (`0x90`), which `ftdi.rs` answers with zeros — see the note there.
+  - If Windows shows a driver error rather than an FTDI device, FTDI’s driver is missing: install it from FTDI rather than from Windows Update’s generic list.
+  - With the VCP driver present it should also appear as a COM port, so xLights / OLA `usbpro` work here too.
+  - **There is no console in this mode.** The TFT still shows everything; `stats`, `info` and `dmx` return when you leave `USB>DMX`. A Python Enttec host is the other route and the only one that exercises every label (`GET_PARAMS`, `SET_PARAMS`, `OUTPUT_DMX`, `RECEIVE_ON_CHANGE`, `GET_SERIAL`) rather than the two a console happens to use.
+- [ ] **BLOCKED — U2 not fitted.** **FTDI port (J2)**: after programming U2 per [ft232rnl-eeprom.md](ft232rnl-eeprom.md), Windows shows `ENTTEC` / `DMX USB PRO`; QLC+ lists a DMX USB Pro; log `FTDI widget: locked at 250000 baud`; faders drive the LEDs in `USB>DMX` mode.
+- [ ] **BLOCKED — U2 not fitted**, and vacuous without it: the test is of U2’s `RESET#` gate. With the box **unpowered**, plugging J2 into a PC does nothing (U2 `RESET#` follows VBUS through R24/R25 and U2 is self-powered from 3V3: no enumeration, no back-drive). With the box powered, it enumerates.
+- [ ] **BLOCKED — U2 not fitted**: baud hunting detects the rate on UART0, and nothing drives UART0. Baud hunting: open the port at 57600 with a Python Enttec script → `locked at 57600 baud`. (Over the module’s CDC port baud is meaningless — there is no UART — so this check has no CDC equivalent.)
 - [ ] **Module USB only** (PSU off, nothing on J2): `V_SYS` ≈ 4.4–4.7 V, `V_LED` ≈ 4.3–4.6 V through D3/F18, P06 = 1 (R41/R42), P05 = 0, strips stay dark (F18 is 0.5 A — firmware must not drive them). Fail → strips lit or F18 cycling = the brightness budget / power-mode logic is not honouring the source.
 - [ ] **Brick on J2 only** (5 V, ≥ 2 A, no PD, 3 A-rated cable), `LED Power` still `External`: `USB_LED_EN` = 0 V (R38), `V_LED` = 0 V (U14 off — a disabled USB power switch passes nothing), `5V_LOGIC` ≈ 4.65 V via F1/D4, P05 = 1 (R39/R40), FAULT high, the unit boots and the display works. Fail → EN high with the setting off = R38 missing / P04 driven high; `V_LED` at ≈ 4.3 V with EN low = something with a body diode was fitted in U14's place.
 - [ ] Set `LED Power = USB brick`: `USB_LED_EN` = 3.3 V (P04 driven high), `V_LED` ramps up (U14 soft start) to ≈ 4.9 V, drop across U14 ≤ 150 mV at 1.3 A full-white on two short strips, FAULT stays high, U14 under 40 °C rise; F2 never trips. Push the load to ≈ 1.6 A: U14 latches off within 10 ms and FAULT goes low (P07 = 0); firmware backs off and re-arms as in stage 7. Then plug the PSU in (trimmed ≥ 5.2 V) while the brick runs: U14 opens once `V_LED` is ≈ 135 mV above the brick (FAULT low, `V_LED` follows the PSU, no `V_SYS` glitch on the scope); unplug the brick: nothing changes.
-- [ ] **PC on J2** with the PSU off: enumerates as DMX USB Pro, logic runs from D4 (≈ 0.35 A from the port), `V_LED` = 0 V, strips dark. Note: P05 is 1 for a PC and a brick alike — the board cannot tell them apart, so the `USB brick` setting is the user's declaration; the manual must say a PC port is not a brick.
+- [ ] **PC on J2** with the PSU off — **the power half is testable now, the enumeration half is blocked** (U2 not fitted, so nothing enumerates): logic runs from D4 (≈ 0.35 A from the port), `V_LED` = 0 V, strips dark. Note: P05 is 1 for a PC and a brick alike — the board cannot tell them apart, so the `USB brick` setting is the user’s declaration; the manual must say a PC port is not a brick.
 
 ### Carried over from the design record
 
