@@ -62,10 +62,16 @@ Three ways to power a unit (see [rev2-power-tree.svg](../dmx_interface_dev_board
 | `host_tests/` | host PC | Unit tests that run `common` on the PC |
 | `dmx_console/` | host PC | Ratatui console: edit settings + live DMX monitor over the USB console port |
 | `xtask/` | host PC | Build helper behind `cargo uf2`: builds pico2 and writes the UF2 for BOOTSEL flashing |
-| `rp2040_dmx/` | RP2040 | Bench firmware for the Rev 1 board: DMX TX test, Enttec CDC test, **FT232R emulator** (`ftdi_test`) |
-| `nucleo/` | STM32H563ZI | **Frozen.** The previous generation; kept as the record of the `common` extraction |
+| `tools/` | host PC | Python bench tools: Art-Net poll/send, Enttec widget driver, bus scope |
+| `vendor/` | — | `embassy-net-wiznet` with the W6300 16 KB socket-0 patch (see its PATCHES.md) |
 | `docs/` | — | Architecture, bring-up checklist, FT232RNL provisioning notes |
-| `reference/` | — | DMX / app-note PDFs |
+| `reference/` | — | DMX handbook and app-note PDFs |
+
+The Rev 1 generation — the STM32 `nucleo` firmware, its `rp2040_dmx` DMX bridge
+and the `DMX_on_pico` Arduino sketch it grew from — was removed from the tree on
+2026-09-25. pico2 carries everything it took from them (the DMX PIO programs,
+the FT232R emulator, the panel configuration). They are in git history before
+that date if a deployed Rev 1 unit ever needs them.
 
 ### What goes in `common/` vs `pico2/`
 

@@ -9,3 +9,6 @@
 # Logic-analyser / scope dumps dropped at the root for analysis (digital.csv is 70 MB).
 /*.csv
 __pycache__/
+
+# JetBrains project files (untracked 2026-09-25)
+.idea/

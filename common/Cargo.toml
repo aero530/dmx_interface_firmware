@@ -12,7 +12,7 @@ default = []
 usb = []
 
 [dependencies]
-# Versions are kept in step with nucleo/Cargo.toml so the sources behave
+# Versions are kept in step with pico2/Cargo.toml so the sources behave
 # identically whichever crate pulls them in.
 # Held at 2.x deliberately: bincode 3 is a semver-major API change on the crate
 # that encodes the EEPROM settings blob. Moving it means re-measuring the

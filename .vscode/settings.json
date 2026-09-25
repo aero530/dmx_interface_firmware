@@ -1,7 +1,7 @@
 {
     "rust-analyzer.linkedProjects": [
-        "./nucleo/Cargo.toml",
-        "./rp2040/Cargo.toml",
-        "./rp2040_dmx/Cargo.toml", 
+        "./Cargo.toml",
+        "./host_tests/Cargo.toml",
+        "./dmx_console/Cargo.toml"
     ]
 }

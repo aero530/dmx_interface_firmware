@@ -236,7 +236,7 @@ It is also a useful catalogue of *how* to check each one on this board.
 
 **The lesson, for the next one of these:** every item above was measured, and
 none of them was the fault. What actually found it was reproducing the *known-good*
-configuration verbatim — Rev 1's `nucleo/src/ui/mod.rs` — on bare hardware, then
+configuration verbatim — Rev 1's display code (the `nucleo` crate, retired 2026-09-25 and in git history before then) — on bare hardware, then
 reverting one difference at a time (that is what the two `panel_probe*` binaries
 are). Do that first. Reasoning forward from the datasheet cost most of a day here,
 and every measurement it suggested came back clean.

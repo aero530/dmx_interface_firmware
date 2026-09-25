@@ -36,7 +36,8 @@
 //!
 //! Everything else — `display_size`, `display_offset`, `Rotation::Deg90`,
 //! `ColorInversion::Inverted`, the 512-byte interface buffer — is copied from
-//! `nucleo/src/ui/mod.rs` unchanged.
+//! the Rev 1 firmware's display code unchanged (the `nucleo` crate, retired
+//! 2026-09-25; git history before then).
 //!
 //! # Wiring (module pin → panel silk)
 //!
@@ -97,13 +98,13 @@ impl embedded_hal::digital::OutputPin for NoCs {
 /// capacitive and this test is about the *protocol*, not signal integrity.
 const SPI_HZ: u32 = 4_000_000;
 
-/// Copied from `common::constants` / `nucleo`: 1.47" 172x320 glass centred in
+/// Copied from `common::constants` / Rev 1: 1.47" 172x320 glass centred in
 /// the controller's 240-wide frame memory.
 const DISPLAY_WIDTH: u16 = 172;
 const DISPLAY_HEIGHT: u16 = 320;
 const DISPLAY_OFFSET: u16 = 34;
 
-/// mipidsi batches pixel data through this. 512 B, as in `nucleo`.
+/// mipidsi batches pixel data through this. 512 B, as in Rev 1.
 static DI_BUFFER: StaticCell<[u8; 512]> = StaticCell::new();
 
 #[embassy_executor::task]
@@ -128,7 +129,7 @@ async fn main(spawner: Spawner) {
     let spi: Spi<'static, SPI1, Blocking> =
         Spi::new_blocking_txonly(p.SPI1, p.PIN_14, p.PIN_11, cfg);
 
-    // Initial levels copied from `nucleo/src/main.rs`, except CS: held low by
+    // Initial levels copied from the Rev 1 firmware, except CS: held low by
     // a plain output for the whole session and hidden from ExclusiveDevice
     // behind a no-op pin — precisely what the Rev 2 firmware does.
     let mut cs_static = Output::new(p.PIN_10, Level::High);

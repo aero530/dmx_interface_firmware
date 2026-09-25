@@ -22,7 +22,7 @@
 extern crate alloc;
 
 // The ported sources (artnet, event_router) use `crate::`-rooted paths. Mirror
-// nucleo's re-export shape so they compile without edits.
+// the Rev 1 firmware's re-export shape so they compile without edits.
 pub use common::constants::*;
 pub use common::{channels, enttec_protocol, ui, DMX_BUFFER, LED_COLORS};
 
@@ -201,7 +201,7 @@ pub mod pins {
 ///   constant near 20 ns on that net.
 ///
 /// Note the Rev 1 board drove this same panel model at **100 MHz requested /
-/// ~50 MHz actual** (`nucleo/src/main.rs`, SPI5) and worked, so the panel
+/// ~50 MHz actual** (the Rev 1 STM32 firmware, SPI5) and worked, so the panel
 /// itself is happy far above anything here — the 3 MHz figure elsewhere in
 /// these notes was the WS2812 LED SPI, not the display. Clock rate is
 /// therefore a signal-integrity workaround on this board, not a panel limit.

@@ -24,14 +24,14 @@ test = false
 bench = false
 
 [features]
-# Mirrors nucleo: `usb` swaps defmt logging for `log` over a USB CDC interface.
+# `usb` swaps defmt logging for `log` over a USB CDC interface.
 # `common/usb` must track it so the shared sources pick the same macros.
 default = []
 usb = ["common/usb"]
 
 [dependencies]
 # Target-agnostic core: settings model, event router, channels, Art-Net,
-# Enttec framing, shared buffers. Same crate the nucleo build uses.
+# Enttec framing, shared buffers.
 common = { path = "../common" }
 
 embassy-rp = { version = "0.10.0", features = [
@@ -115,8 +115,8 @@ critical-section = "1.1"
 static_cell = "2.1"
 
 # `common::ui::fields` formats menu strings, so the binary must supply an
-# allocator. Far smaller here than on nucleo: a 128x64 mono framebuffer is
-# 1 KB against the TFT's ~108 KB.
+# allocator. Only menu strings need it: the TFT is drawn straight to the panel,
+# so there is no framebuffer on the heap.
 embedded-alloc = "0.7.0"
 
 smart-leds = "0.4.0"

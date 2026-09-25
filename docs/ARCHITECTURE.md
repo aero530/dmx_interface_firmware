@@ -79,8 +79,11 @@ to the STM32 generation this replaced — the Art-Net task ported unchanged.
 | `host_tests/` | host | Tests `common` directly — 71 tests |
 | `dmx_console/` | host | Desktop settings/monitor app |
 | `xtask/` | host | `cargo uf2`: builds pico2 and converts the ELF to an RP2350 UF2 for BOOTSEL flashing |
-| `rp2040_dmx/` | RP2040 | Rev 1 bench firmware, kept for the FT232R emulator |
-| `nucleo/` | STM32H563ZI | **Frozen.** The previous generation, kept as the record of the extraction |
+| `tools/` | host | Python bench tools (Art-Net, Enttec widget, bus scope) |
+| `vendor/` | — | Patched `embassy-net-wiznet` (W6300 socket-0 RX buffer) |
+
+The Rev 1 crates (`nucleo`, `rp2040_dmx`) and the `DMX_on_pico` sketch were
+removed on 2026-09-25; git history before that date has them.
 
 **The dividing line is a concrete peripheral type or `#[embassy_executor::task]`.**
 A signature naming `Spi<'static, Async>` stays in `pico2/`; the logic it drives

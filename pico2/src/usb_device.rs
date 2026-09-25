@@ -239,7 +239,8 @@ async fn run_cdc(
     config.max_power = 500;
     // Composite device with Interface Association Descriptors: without them
     // Windows will not bind its CDC driver to each serial function separately.
-    // Verified on the rp2040_dmx bench firmware, which uses the same layout.
+    // Verified on the Rev 1 bench firmware (`rp2040_dmx`, retired), which used
+    // the same layout.
     config.device_class = 0xEF;
     config.device_sub_class = 0x02;
     config.device_protocol = 0x01;

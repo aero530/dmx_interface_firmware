@@ -3,7 +3,7 @@
 //! The RP2040 bridge is gone: DMX runs in-process on PIO2, which deletes the
 //! I²C bridge protocol, its 30 ms poll, and the whole class of bugs the Rev 1
 //! review found in that link (§1.1, §1.2). The PIO driver in `dmx_pio.rs` is the
-//! `rp2040_dmx` one, unchanged — it derives its clock divider from
+//! Rev 1 bridge's (`rp2040_dmx`, retired 2026-09-25), unchanged — it derives its clock divider from
 //! `clk_sys_freq()`, so it adapts from the RP2040's 125 MHz to the RP2350's
 //! 150 MHz on its own.
 //!

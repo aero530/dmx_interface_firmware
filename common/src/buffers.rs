@@ -23,9 +23,9 @@
 //! Consumers must link a `critical-section` implementation — and on a
 //! multi-core target it must be a CROSS-CORE one. The pico2 build gets the
 //! hardware-spinlock implementation from embassy-rp's `critical-section-impl`
-//! feature (single-core `cortex-m` impls would be unsound there); the nucleo
-//! build uses `cortex-m/critical-section-single-core`; the host uses
-//! `critical-section/std`.
+//! feature (single-core `cortex-m` impls would be unsound there); a
+//! single-core target would use `cortex-m/critical-section-single-core`; the
+//! host uses `critical-section/std`.
 
 use core::cell::Cell;
 

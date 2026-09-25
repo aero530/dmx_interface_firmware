@@ -1,10 +1,9 @@
 [workspace]
 resolver = "3"
-members = [ "common", "pico2", "rp2040_dmx", "xtask", "vendor/embassy-net-wiznet"]
+members = [ "common", "pico2", "xtask", "vendor/embassy-net-wiznet"]
 # dmx_console (PC tool) and host_tests (host-runnable firmware unit tests)
 # have their own dependency trees; keeping them out of the embedded
-# workspace keeps Cargo.lock clean. rp2040 is an empty placeholder crate,
-# excluded until it has real code.
+# workspace keeps Cargo.lock clean.
 #
 # `xtask` is a dependency-free host helper (`cargo uf2` builds the firmware
 # and converts the ELF to a UF2 for BOOTSEL flashing). It has no dependencies,
@@ -14,17 +13,14 @@ members = [ "common", "pico2", "rp2040_dmx", "xtask", "vendor/embassy-net-wiznet
 #
 # NOTE: `cargo build --workspace` is not supported — build from inside each
 # crate's folder (which also applies its .cargo/config.toml target/runner).
-# Workspace-wide builds feature-unify `critical-section`, and nucleo
-# (single-core, restore-state-bool) and rp2040_dmx (multicore,
-# restore-state-u8) require conflicting implementations.
-# `nucleo` is FROZEN, not deleted. It stopped building when `common` moved to
-# embassy-sync 0.8: embassy-stm32 0.4 -> 0.6 and embassy-net 0.7 -> 0.9 need a
-# ~72-error migration, including a reworked Ethernet PHY API — on the exact code
-# the W6300 replaces. Its job (proving the Phase 1 extraction of `common` stayed
-# faithful) is done and passed; `common` is now validated by host_tests and by
-# pico2 compiling against it. Delete once pico2 ships, or migrate if a deployed
-# STM32 unit ever needs patching.
-exclude = ["dmx_console", "host_tests", "nucleo", "rp2040"]
+# `xtask` is a host binary and `pico2` an ARM one, and a workspace-wide build
+# would try to compile both for whichever target the invoking folder selects.
+#
+# The Rev 1 crates (`nucleo`, the STM32 firmware; `rp2040_dmx`, its DMX
+# bridge; `rp2040`, an empty placeholder) and the original `DMX_on_pico`
+# Arduino sketch were removed on 2026-09-25 once pico2 carried everything
+# taken from them. They are in git history before that date.
+exclude = ["dmx_console", "host_tests"]
 
 # `embassy-net-wiznet` is vendored at 0.3.0 with one patch: the W6300 socket-0
 # RX buffer raised from 4 KB to the chip's full 16 KB, which needed sockets 1-7
@@ -36,7 +32,7 @@ exclude = ["dmx_console", "host_tests", "nucleo", "rp2040"]
 embassy-net-wiznet = { path = "vendor/embassy-net-wiznet" }
 
 # Build profiles must be defined here: cargo silently ignores [profile.*]
-# sections in workspace member manifests (nucleo, rp2040_dmx, ...).
+# sections in workspace member manifests (pico2, common, ...).
 
 # cargo build/run
 [profile.dev]
