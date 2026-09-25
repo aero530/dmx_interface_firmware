@@ -10,11 +10,29 @@ lighting console cannot answer because you never see the bytes it sends.
     python tools/enttec.py --port COM5 --map 12        # walk channels 1..12
     python tools/enttec.py --port COM5 --channel 1 --value 255
     python tools/enttec.py --port COM5 --pattern chase --leds 64
+    python tools/enttec.py --port COM5 --monitor       # watch DMX the board receives
 
-The board must be in `USB>DMX` mode, where it enumerates as an FT232R and
-Windows' FTDI VCP driver gives it a COM port. In any other mode it is a
-composite CDC device and the widget port is the *first* of the CDC ports, which
-this tool can drive just the same.
+# Which mode does what
+
+**Anything that sends DMX needs the board in `USB>DMX` mode.** The firmware
+accepts label 6 only in that mode, on purpose - a PC plugged in while the rig
+runs off wired DMX or Art-Net must not be able to clobber the live universe
+(`enttec_widget.rs`, `handle_message`). In any other mode those frames are
+dropped silently, so `--map`, `--channel` and `--pattern` appear to do nothing.
+That is the design, not a fault, and this tool warns rather than leaving you to
+guess.
+
+`--params` and `--serial` answer in **every** mode, which makes them the way to
+prove the port and the framing before blaming anything else.
+
+`--monitor` is the counterpart for the other direction: outside `USB>DMX` the
+widget forwards whatever the board is receiving - wired DMX, Art-Net or sACN,
+whichever the mode selects - as label 5 on change. That is the one test that
+exercises the widget without switching modes.
+
+In `USB>DMX` the board is an FT232R and Windows' FTDI VCP driver gives it a COM
+port. In every other mode it is a composite CDC device and the widget is the
+*first* of its three CDC ports (widget, console, log).
 
 # The framing
 
@@ -38,12 +56,25 @@ import time
 START_DELIMITER = 0x7E
 END_DELIMITER = 0xE7
 LABEL_GET_PARAMS = 3
+# What the board sends unprompted when the DMX it receives changes.
+LABEL_RECEIVE_ON_CHANGE_REPLY = 5
 LABEL_OUTPUT_DMX = 6
 LABEL_GET_SERIAL = 10
 UNIVERSE = 512
 
 
 # ------------------------------------------------------------------ framing
+def warn_needs_usb_dmx() -> None:
+    """Say it before the test rather than after it fails.
+
+    The firmware drops label 6 outside `USB>DMX` and says nothing, so a wrong
+    mode and a broken cable look identical from here.
+    """
+    print("NOTE: sending DMX needs the board in USB>DMX mode. In any other mode the")
+    print("      firmware drops these frames on purpose and nothing will light.")
+    print("      `--params` still answers in every mode; use it to prove the port.\n")
+
+
 def frame(label: int, payload: bytes) -> bytes:
     n = len(payload)
     return bytes([START_DELIMITER, label, n & 0xFF, (n >> 8) & 0xFF]) + payload + bytes([END_DELIMITER])
@@ -208,6 +239,12 @@ def main() -> int:
     ap.add_argument("--color", default="255,255,255", help="R,G,B for the patterns")
     ap.add_argument("--rate", type=float, default=30.0, help="frames/s for --pattern")
     ap.add_argument("--seconds", type=float, default=0.0, help="0 = until Ctrl-C")
+    ap.add_argument("--monitor", action="store_true",
+                    help="decode the label-5 frames the board sends when the DMX it "
+                         "receives changes. Works in every mode except USB>DMX, where the "
+                         "host is the source and there is nothing to forward.")
+    ap.add_argument("--channels", type=int, default=16, metavar="N",
+                    help="channels to show per --monitor update (default 16)")
     ap.add_argument("--no-start-code", action="store_true",
                     help="send 512 channel bytes with no leading start code. Some hosts do "
                          "this; if it changes which pixel lights, that byte is the disagreement.")
@@ -251,7 +288,36 @@ def main() -> int:
                           f"MAB {payload[3]}, refresh {payload[4]} Hz")
             return 0
 
+        if args.monitor:
+            print("watching for label-5 frames (Ctrl-C to stop).")
+            print("Silence means the received universe is not changing, or the board is in")
+            print("USB>DMX mode where the host is the source and nothing is forwarded.\n")
+            buf = b""
+            frames = 0
+            try:
+                while True:
+                    buf += ser.read(4096)
+                    msgs = unframe(buf)
+                    if msgs:
+                        # Keep only what follows the last complete message.
+                        buf = b""
+                    for lbl, payload in msgs:
+                        if lbl != LABEL_RECEIVE_ON_CHANGE_REPLY:
+                            print(f"  label {lbl}: {payload[:16].hex()}")
+                            continue
+                        frames += 1
+                        # Payload is a start code then the channels, same as
+                        # label 6 - so channel 1 is payload[1].
+                        chans = payload[1:1 + args.channels]
+                        shown = " ".join(f"{b:3d}" for b in chans)
+                        print(f"  [{frames:5d}] start {payload[0]:#04x} | {shown}")
+                    time.sleep(0.05)
+            except KeyboardInterrupt:
+                print(f"\n(stopped after {frames} frames)")
+            return 0
+
         if args.map:
+            warn_needs_usb_dmx()
             print(f"walking channels 1..{args.map}, {args.dwell:g}s each, value 255.")
             print("Note which pixel and which colour lights for each.\n")
             for ch in range(1, args.map + 1):
@@ -266,11 +332,13 @@ def main() -> int:
             return 0
 
         if args.channel:
+            warn_needs_usb_dmx()
             ser.write(frame(LABEL_OUTPUT_DMX, dmx_payload({args.channel: args.value}, start_code)))
             print(f"  channel {args.channel} = {args.value}, all others 0")
             return 0
 
         if args.pattern:
+            warn_needs_usb_dmx()
             colour = tuple(int(c) for c in args.color.split(","))
             period = 1.0 / args.rate
             started = time.perf_counter()

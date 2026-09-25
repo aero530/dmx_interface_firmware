@@ -36,7 +36,17 @@ use common::events::SmartLedEvent;
 use common::ui::{SmartLedColorMode, BLACK};
 use common::usb_power;
 use common::{LED_COLORS, SMARTLED_PORT_COUNT};
-use defmt::*;
+// Logging goes wherever the build says: `defmt` over RTT by default, the
+// `log` crate over USB with `--features usb`. Format strings therefore have
+// to parse as both - no `{=type}` hints. See `usb_log.rs`.
+use cfg_if::cfg_if;
+cfg_if! {
+    if #[cfg(feature = "usb")] {
+        use log::{info};
+    } else {
+        use defmt::{info};
+    }
+}
 use embassy_futures::join::{join, join4};
 use embassy_rp::peripherals::{PIO0, PIO1, PIO2};
 use smart_leds::{White, RGBW};
@@ -145,6 +155,9 @@ pub async fn smart_led_task(mut out: Ws2812Outputs, rx: SmartLedChannelRx) {
         // so normal content cannot latch it off. Unity (256) otherwise, and the
         // whole block costs one multiply per channel only when it bites.
         let scale = usb_power::budget_scale(channel_sum);
+        // Publish it for the title row: dim strips with no explanation read as
+        // a fault, and this is the difference between "broken" and "working".
+        usb_power::set_scale(scale);
         for i in 0..STRINGS {
             let n = counts_used[i];
             if scale != 256 {

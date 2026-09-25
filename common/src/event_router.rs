@@ -4,10 +4,11 @@ use crate::artnet::PortAddress;
 use crate::events::{ButtonEvent, KeyPadButton, KeyPadEvent, NetStatus};
 use crate::channels::*;
 use crate::events::{EepromEvent, SmartLedEvent, UiEvent};
-use crate::ui::{ArtNetAddr, BootStatus, FieldId, InputMode, IpAddrMenu, MenuData, ModuleSettings, ModuleType, SmartLedPortMode};
-use crate::{DMX_BUFFER, DMX_UNIVERSE_SIZE, LED_COLORS};
+use crate::ui::{ArtNetAddr, BLACK, BootStatus, FieldId, InputMode, IpAddrMenu, MenuData, ModuleSettings, ModuleType, SmartLedPortMode};
+use crate::{DMX_BUFFER, DMX_UNIVERSE_SIZE, LED_COLORS, SMARTLED_PORT_COUNT};
 use core::net::Ipv4Addr;
 use defmt::Format;
+use smart_leds::RGBW;
 
 use cfg_if::cfg_if;
 cfg_if! {
@@ -41,6 +42,81 @@ use micromath::F32Ext;
 /// depending on the input mode (the 2026-07 review logged this as N18).
 /// `saturating_sub` keeps address 0 — which the UI does not allow, but an old
 /// EEPROM or the console can still produce — pinned at the start of the slot.
+/// Paint one port: blank whatever the layout does not cover, then fill each
+/// item's run.
+///
+/// Split out of the render so the **blanking** can be tested against a dirty
+/// buffer, which is the only way to catch a missing one: WS2812s latch, so a
+/// pixel that is never written keeps its last colour, and a test that renders
+/// into an already-black buffer passes whether or not this function blanks.
+///
+/// Blanking first, rather than painting and then tidying the leftovers, is what
+/// makes one rule cover every case: a declared gap, the tail past the last item,
+/// pixels freed by shrinking an item or dropping one, and a switch to a layout
+/// that reaches less far than the one before it.
+///
+/// `span(item)` gives `(start, leds)` or `None`; `color(item)` is called only
+/// for items that have somewhere to go.
+/// The colour item `item` reads, from `base` bytes into the DMX buffer.
+///
+/// The bounds guards are the ones both render branches used to carry inline.
+/// They matter because `base` is built from operator-set values (the DMX start
+/// address, the Art-Net base, the per-port stride), so a configuration can point
+/// past the end of the buffer and must clamp rather than panic.
+fn item_color(
+    dmx: &[u8],
+    mode: crate::ui::SmartLedColorMode,
+    base: usize,
+    item: usize,
+) -> RGBW<u8> {
+    let width = mode.addr_size();
+    let mut start = base + item * width;
+    let mut end = start + width - 1;
+
+    if end >= dmx.len() {
+        warn!("DMX buffer end {} > buffer length {}.", end, dmx.len());
+        end = dmx.len() - 1;
+    }
+    if start >= dmx.len() {
+        warn!("DMX buffer start {} > buffer length {}.", start, dmx.len());
+        start = dmx.len() - 1;
+    }
+    if start > end {
+        warn!("DMX buffer start {} > buffer end {}.", start, end);
+        start = end;
+    }
+    mode.color(&dmx[start..=end])
+}
+
+pub fn paint_port(
+    out: &mut [RGBW<u8>],
+    leds: usize,
+    items: usize,
+    span: impl Fn(usize) -> Option<(u16, u16)>,
+    color: impl Fn(usize) -> RGBW<u8>,
+) {
+    // Beyond the configured count nothing is clocked out, so there is no point
+    // blanking or painting it.
+    let leds = leds.min(out.len());
+    out[..leds].fill(BLACK);
+
+    for item in 0..items {
+        let Some((start, len)) = span(item) else {
+            continue;
+        };
+        let c = color(item);
+        for i in 0..len as usize {
+            let place = start as usize + i;
+            // A group that does not divide the LED count, or a fixture list
+            // longer than the strip, stops here rather than past the end.
+            if place >= leds {
+                break;
+            }
+            out[place] = c;
+        }
+    }
+}
+
 pub fn buffer_index(dmx_address: u16, is_network: bool) -> usize {
     if is_network {
         (dmx_address as usize).saturating_sub(1)
@@ -390,7 +466,14 @@ impl Router {
             match self.data.menu_settings.module {
                 ModuleSettings::SmartLed(smart_led_settings) => {
 
-                    let dmx_group_size = smart_led_settings.dmx_group_size.0;
+                    // One 80-byte snapshot for the whole frame, taken before
+                    // the buffer locks below. Two reasons: the lock ordering
+                    // stays `FIXTURE_MAP` (blocking, released immediately) then
+                    // the async buffers, so no cross-core cycle exists; and a
+                    // layout edited mid-frame cannot paint half of one
+                    // arrangement and half of another.
+                    let fixtures = crate::buffers::fixture_map();
+                    let layout = smart_led_settings.layout(&fixtures);
                     // Lock global dmx data buffer
                     let dmx_buffer = DMX_BUFFER.lock().await;
 
@@ -431,52 +514,19 @@ impl Router {
                             // (DMX-style layouts store their single universe at offset 0)
                             let mut port_virtual_led_offset = if input_mode.is_network() { network_base } else { 0 };
 
-                            for (port_index, num_virtual_leds) in smart_led_settings.virtual_leds_per_port().iter().enumerate() {
-                                // Calculate hoe many universes this port consumes. Each new port will start at a new universe...I think.
-                                // let port_universe_count = match self.data.menu_settings.input_mode {
-                                //     InputMode::Dmx => 0, // DMX can only handle one universe
-                                //     InputMode::ArtNet => (*num_virtual_leds as f32 * smart_led_settings.color_mode.addr_size() as f32 / DMX_UNIVERSE_SIZE as f32).ceil() as usize,
-                                // };
-                                //
-                                // let dmx_addr_offset = match self.data.menu_settings.input_mode {
-                                //     InputMode::Dmx => 0, // DMX can only handle one universe
-                                //     InputMode::ArtNet => port_u_offset * DMX_UNIVERSE_SIZE,
-                                // };
+                            for (port_index, num_virtual_leds) in layout.virtual_leds_per_port().iter().enumerate() {
+                                let base = dmx_address_index + port_virtual_led_offset;
+                                // Blanks first, then paints each item's run —
+                                // see `paint_port` for why that order is the
+                                // whole gap/tail/shrink story in one rule.
+                                paint_port(
+                                    &mut colors[port_index],
+                                    smart_led_settings.leds_per_port[port_index] as usize,
+                                    *num_virtual_leds as usize,
+                                    |item| layout.item_span(port_index, item),
+                                    |item| item_color(&dmx_buffer[..], smart_led_settings.color_mode, base, item),
+                                );
 
-                                // Copy data from DMX_BUFFER to LED_COLORS
-                                for vled_index in 0..*num_virtual_leds as usize {
-                                    let mut dmx_buffer_start = dmx_address_index + port_virtual_led_offset + vled_index * smart_led_settings.color_mode.addr_size();
-                                    let mut dmx_buffer_end = dmx_buffer_start + smart_led_settings.color_mode.addr_size() - 1;
-
-                                    // Catch out of bounds errors where the calculated start or end are outside the bounds of dmx_buffer
-                                    if dmx_buffer_end >= dmx_buffer.len() {
-                                        warn!("DMX buffer end {} > buffer length {}.", dmx_buffer_end, dmx_buffer.len());
-                                        dmx_buffer_end = dmx_buffer.len() - 1;
-                                    }
-
-                                    if dmx_buffer_start >= dmx_buffer.len() {
-                                        warn!("DMX buffer start {} > buffer length {}.", dmx_buffer_start, dmx_buffer.len());
-                                        dmx_buffer_start = dmx_buffer.len() - 1;
-                                    }
-
-                                    if dmx_buffer_start > dmx_buffer_end {
-                                        warn!("DMX buffer start {} > buffer end {}.", dmx_buffer_start, dmx_buffer_end);
-                                        dmx_buffer_start = dmx_buffer_end;
-                                    }
-
-                                    let c = smart_led_settings.color_mode.color(&dmx_buffer[dmx_buffer_start..=dmx_buffer_end]); // calculate a color from the dmx data
-
-                                    // Loop through each group and assign to individual LEDs
-                                    for i in 0..dmx_group_size[port_index] {
-                                        let place = i as usize + dmx_group_size[port_index] as usize * vled_index;
-                                        // The last virtual LED group can extend past the color buffer
-                                        // when the group size does not evenly divide the LED count
-                                        if place >= colors[port_index].len() {
-                                            break;
-                                        }
-                                        colors[port_index][place] = c;
-                                    }
-                                }
                                 port_virtual_led_offset += if input_mode.is_network() {
                                     // Each port starts on a universe boundary: offset by the
                                     // universes this port uses times the size of a universe
@@ -491,39 +541,28 @@ impl Router {
                             // Offset into the flat one-net buffer; always 0 for DMX, the
                             // configured base for the network modes (same as Individual mode)
                             let universe_offset = if input_mode.is_network() { network_base } else { 0 };
+                            let base = dmx_address_index + universe_offset;
+                            // Port 1 sets how many addressable items there are.
+                            let groups = layout.mirror_items() as usize;
 
-                            for vled_index in 0..smart_led_settings.virtual_leds_per_port()[0] as usize {
-                                let mut dmx_buffer_start = dmx_address_index + universe_offset + vled_index * smart_led_settings.color_mode.addr_size();
-                                let mut dmx_buffer_end = dmx_buffer_start + smart_led_settings.color_mode.addr_size() - 1;
-
-                                // Catch out of bounds errors where the calculated start or end are outside the bounds of dmx_buffer
-                                if dmx_buffer_end >= dmx_buffer.len() {
-                                    warn!("DMX buffer end {} > buffer length {}.", dmx_buffer_end, dmx_buffer.len());
-                                    dmx_buffer_end = dmx_buffer.len() - 1;
-                                }
-
-                                if dmx_buffer_start >= dmx_buffer.len() {
-                                    warn!("DMX buffer start {} > buffer length {}.", dmx_buffer_start, dmx_buffer.len());
-                                    dmx_buffer_start = dmx_buffer.len() - 1;
-                                }
-
-                                if dmx_buffer_start > dmx_buffer_end {
-                                    warn!("DMX buffer start {} > buffer end {}.", dmx_buffer_start, dmx_buffer_end);
-                                    dmx_buffer_start = dmx_buffer_end;
-                                }
-
-                                let c = smart_led_settings.color_mode.color(&dmx_buffer[dmx_buffer_start..=dmx_buffer_end]); // calculate a color from the dmx data
-
-                                for i in 0..dmx_group_size[0] {
-                                    let place = i as usize + dmx_group_size[0] as usize * vled_index;
-                                    for (port_index, _) in smart_led_settings.virtual_leds_per_port().iter().enumerate() {
-                                        // The last virtual LED group can extend past the color buffer
-                                        // when the group size does not evenly divide the LED count
-                                        if place < colors[port_index].len() {
-                                            colors[port_index][place] = c;
-                                        }
-                                    }
-                                }
+                            // One block of DMX, eight ports reading it. Each
+                            // applies its own geometry: the proportionally
+                            // scaled size under `Groups`, its own run list under
+                            // `Fixtures` - see `mirror_item_span`.
+                            //
+                            // Through the same `paint_port` as the other branch,
+                            // so the blanking rule is written once. The tail-only
+                            // pass that used to run after this loop is gone with
+                            // it: that one could not reach a gap in the middle of
+                            // a strip, only the end.
+                            for port_index in 0..SMARTLED_PORT_COUNT {
+                                paint_port(
+                                    &mut colors[port_index],
+                                    smart_led_settings.leds_per_port[port_index] as usize,
+                                    groups,
+                                    |item| layout.mirror_item_span(port_index, item),
+                                    |item| item_color(&dmx_buffer[..], smart_led_settings.color_mode, base, item),
+                                );
                             }
                         }
                     }

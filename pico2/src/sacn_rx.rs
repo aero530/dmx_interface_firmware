@@ -31,7 +31,17 @@ use common::artnet::PortAddress;
 use common::sacn::{multicast_group, parse, PORT};
 use common::ui::InputMode;
 use common::{DMX_BUFFER, DMX_UNIVERSE_COUNT, DMX_UNIVERSE_SIZE};
-use defmt::*;
+// Logging goes wherever the build says: `defmt` over RTT by default, the
+// `log` crate over USB with `--features usb`. Format strings therefore have
+// to parse as both - no `{=type}` hints. See `usb_log.rs`.
+use cfg_if::cfg_if;
+cfg_if! {
+    if #[cfg(feature = "usb")] {
+        use log::{error, info, warn};
+    } else {
+        use defmt::{error, info, warn};
+    }
+}
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpAddress, Stack};
 

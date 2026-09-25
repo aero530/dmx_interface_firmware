@@ -22,7 +22,24 @@ fn group_sizes(data: &MenuData) -> [u16; common::SMARTLED_PORT_COUNT] {
 #[test]
 fn pages_have_expected_shape() {
     let titles: Vec<&str> = PAGES.iter().map(|p| p.title).collect();
-    assert_eq!(titles, ["Main", "Network", "LED", "Groups", "LEDs", "System"]);
+    // "Groups" became "Layout" when `LedGrouping` landed: under Individual the
+    // page shows 1s and under Fixtures it is the way into the per-port tables,
+    // so the old name was wrong in two of the three modes.
+    //
+    // Only the RING is pinned by name. The eight fixture tables are `Detail`
+    // pages: they are in `PAGES` so the console can reach them, but Up/Down and
+    // Esc must skip them or an operator walks through eight tables to get back
+    // to Main - and through all eight even in a mode with no fixtures.
+    // `LEDs` before `Layout`: a port's layout is meaningless until the strip
+    // length is set, and every length bound on the Layout page derives from it.
+    let ring: Vec<&str> = PAGES.iter().filter(|p| p.in_ring()).map(|p| p.title).collect();
+    assert_eq!(ring, ["Main", "Network", "LED", "LEDs", "Layout", "System"]);
+    assert_eq!(
+        PAGES.iter().filter(|p| !p.in_ring()).count(),
+        common::SMARTLED_PORT_COUNT,
+        "one fixture table per port"
+    );
+    let _ = titles;
     // Every page fits the 11-row TFT layout (the title/status row takes one)
     for page in PAGES {
         assert!(
@@ -46,6 +63,13 @@ fn console_keys_are_unique() {
 fn numeric_fields_expose_values_on_default_settings() {
     let data = defaults();
     for field in all_fields().filter(|f| f.digits() > 0) {
+        if field.fixture_slot().is_some() {
+            // `display()` cannot render a fixture - the map is not in
+            // `MenuData` - so there is nothing here to put a cursor on. The
+            // equivalent check against `fixture_display` is in
+            // `tests/fixtures.rs`.
+            continue;
+        }
         // display() zero-pads numerics to the digit count used by the editor
         // (plus the dots of a dotted quad), so the cursor always lands on a
         // rendered character
@@ -58,7 +82,9 @@ fn numeric_fields_expose_values_on_default_settings() {
         for d in 0..field.digits() {
             let col = field.cursor_column(d) as usize;
             let ch = field.display(&data).chars().nth(col).expect("cursor inside the value");
-            assert!(ch.is_ascii_digit(), "field {} digit {d} cursor sits on {ch:?}", field.key());
+            if field.digit_is_numeric(d) {
+                assert!(ch.is_ascii_digit(), "field {} digit {d} cursor sits on {ch:?}", field.key());
+            }
         }
     }
 }
@@ -470,4 +496,112 @@ fn led_power_toggles_parses_and_transfers() {
     FieldId::LedPower.transfer(&draft, &mut committed);
     assert_eq!(committed.led_power, LedPower::UsbBrick);
     assert_eq!(committed.dmx_address, 77, "unrelated field must survive the merge");
+}
+
+// ---------------------------------------------------------------------------
+// Generic guards. These catch whole classes rather than one field each, which
+// is what makes them worth their weight: a new field is covered the day it is
+// added, with nobody having to remember to write a test for it.
+// ---------------------------------------------------------------------------
+
+/// Nudge a field to a value that differs from `defaults()`, or return `None`
+/// if nothing moves it.
+///
+/// Every digit is tried, not just digit 0. `ArtNetSubNet` is the case that
+/// makes this necessary: it is two digits with a range of 0..=3, so the tens
+/// digit can never move without being rejected, and a test that only pokes
+/// digit 0 would conclude the field is immovable.
+fn nudged(field: FieldId) -> Option<MenuData> {
+    let base = defaults();
+    let digits = field.digits().max(1);
+    for digit in 0..digits {
+        for up in [true, false] {
+            let mut candidate = defaults();
+            field.adjust(&mut candidate, digit, up);
+            if field.display(&candidate) != field.display(&base) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn every_editable_value_round_trips_through_the_console() {
+    // `console_usb.rs` parses `set <key> <value>` with a whitespace split and
+    // keeps only the second token, so feeding `get` output back in sends just
+    // the first word of the rendered value. That has to be enough to restore
+    // the same value, or the console silently sets something else.
+    //
+    // This is deliberately the round-trip property rather than "no whitespace
+    // in the value": `LedPower` renders "USB brick" and survives only because
+    // the first token lowercases to a spelling `set_from_str` accepts. That is
+    // luck, but it is *working* luck, and a whitespace ban would have failed it
+    // while proving nothing about the fields that matter.
+    for field in all_fields() {
+        if !field.editable() {
+            continue;
+        }
+        if field.fixture_slot().is_some() {
+            // Fixtures are edited through the map, not through `MenuData`, so
+            // neither `adjust` nor `transfer` can reach them. Covered instead by
+            // the dedicated round-trip tests in `tests/fixtures.rs` - skipping
+            // them here silently would leave a hole, so this is deliberate.
+            continue;
+        }
+        let Some(src) = nudged(field) else {
+            continue; // nothing to round-trip
+        };
+        let rendered = field.display(&src);
+        let token = rendered.split_whitespace().next().unwrap_or("");
+
+        let mut dst = defaults();
+        assert!(
+            field.set_from_str(&mut dst, token).is_ok(),
+            "{:?}: `get` prints {:?}, but `set {} {}` is rejected",
+            field,
+            rendered,
+            field.key(),
+            token
+        );
+        assert_eq!(
+            field.display(&dst),
+            rendered,
+            "{:?}: `set {} {}` produced a different value than `get` showed",
+            field,
+            field.key(),
+            token
+        );
+    }
+}
+
+#[test]
+fn every_editable_field_actually_transfers() {
+    // `transfer()` ends in `_ => {}`, so a field with no arm is accepted by the
+    // UI, written to the EEPROM unchanged, and then REVERTED on the next
+    // `UiEvent::Load` - while the console prints `ok`. Nothing else catches it.
+    for field in all_fields() {
+        if !field.editable() {
+            continue;
+        }
+        if field.fixture_slot().is_some() {
+            // Fixtures are edited through the map, not through `MenuData`, so
+            // neither `adjust` nor `transfer` can reach them. Covered instead by
+            // the dedicated round-trip tests in `tests/fixtures.rs` - skipping
+            // them here silently would leave a hole, so this is deliberate.
+            continue;
+        }
+        let Some(src) = nudged(field) else {
+            panic!("{field:?}: no digit or direction changes it, so it cannot be tested");
+        };
+
+        let mut dst = defaults();
+        field.transfer(&src, &mut dst);
+        assert_eq!(
+            field.display(&dst),
+            field.display(&src),
+            "{:?} has no `transfer` arm - edits will commit and then silently revert",
+            field
+        );
+    }
 }

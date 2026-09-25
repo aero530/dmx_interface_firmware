@@ -3,8 +3,9 @@
 //! event router relies on.
 
 use common::ui::{
-    ArtNetAddr, BootStatus, EthernetIPMode, IncDec, InputMode, IpAddrMenu, LedPower, MenuData,
-    ModuleSettings, SmartLedColorMode, SmartLedDmxGroupSize, SmartLedPortMode, SmartLedSettings,
+    ArtNetAddr, BootStatus, EthernetIPMode, IncDec, InputMode, IpAddrMenu, LedGrouping, LedPower,
+    MenuData, ModuleSettings, SmartLedColorMode, SmartLedDmxGroupSize, SmartLedPortMode,
+    SmartLedSettings,
 };
 // The very constant the firmware's EEPROM driver writes with (`pico2/src/eeprom.rs`
 // re-exports it), so this suite cannot drift from it.
@@ -29,6 +30,9 @@ fn smart_led(leds: [u16; 4], groups: [u16; 4], color: SmartLedColorMode) -> Smar
         leds_per_port: widen(leds, 0),
         color_mode: color,
         port_mode: SmartLedPortMode::Individual,
+        // These fixtures exercise the stored group sizes, so the grouping mode
+        // must be the one that uses them.
+        grouping: LedGrouping::Groups,
         dmx_group_size: SmartLedDmxGroupSize(widen(groups, 1)),
     }
 }
@@ -264,6 +268,9 @@ fn all(leds: u16, group: u16, color: SmartLedColorMode) -> SmartLedSettings {
         leds_per_port: [leds; SMARTLED_PORT_COUNT],
         color_mode: color,
         port_mode: SmartLedPortMode::Individual,
+        // These fixtures exercise the stored group sizes, so the grouping mode
+        // must be the one that uses them.
+        grouping: LedGrouping::Groups,
         dmx_group_size: SmartLedDmxGroupSize([group; SMARTLED_PORT_COUNT]),
     }
 }
@@ -317,4 +324,120 @@ fn total_universes_stays_inside_the_buffer() {
     // drops anything above it, so a configuration that needs more is flagged.
     let s = all(600, 1, SmartLedColorMode::Rgb);
     assert!(s.total_universes() as usize <= common::DMX_UNIVERSE_COUNT);
+}
+
+// ---------------------------------------------------------------------------
+// `LedGrouping::Individual` is `Groups` with every size pinned to 1 — not a
+// second layout that happens to agree. These tests are the reason it is routed
+// through one accessor.
+// ---------------------------------------------------------------------------
+
+fn with_grouping(s: SmartLedSettings, grouping: LedGrouping, mirror: bool) -> SmartLedSettings {
+    SmartLedSettings {
+        grouping,
+        port_mode: if mirror {
+            SmartLedPortMode::Mirror
+        } else {
+            SmartLedPortMode::Individual
+        },
+        ..s
+    }
+}
+
+#[test]
+fn individual_is_exactly_groups_with_every_size_one() {
+    // The regression this guards: an earlier design defined Mirror+Individual
+    // as 1:1 per pixel. Size 1 is the shipping default and Mirror stretches
+    // proportionally, so a 200-LED port mirroring a 100-LED port groups by 2 —
+    // a 1:1 rule would have darkened half of it, one toggle from defaults.
+    let mut leds = [150_u16; SMARTLED_PORT_COUNT];
+    leds[1] = 300; // longer, so Mirror's proportional scaling is exercised
+    leds[2] = 75; // shorter
+    leds[3] = 0; // disabled
+
+    for mirror in [false, true] {
+        // Individual, with deliberately noisy stored sizes it must ignore.
+        let noisy = SmartLedSettings {
+            leds_per_port: leds,
+            color_mode: SmartLedColorMode::Rgb,
+            port_mode: SmartLedPortMode::Individual,
+            grouping: LedGrouping::Groups,
+            dmx_group_size: SmartLedDmxGroupSize([7; SMARTLED_PORT_COUNT]),
+        };
+        let individual = with_grouping(noisy, LedGrouping::Individual, mirror);
+
+        // Groups, with the sizes Individual claims to mean.
+        let ones = SmartLedSettings {
+            dmx_group_size: SmartLedDmxGroupSize([1; SMARTLED_PORT_COUNT]),
+            ..noisy
+        };
+        let groups = with_grouping(ones, LedGrouping::Groups, mirror);
+
+        let what = if mirror { "Mirror" } else { "Individual ports" };
+        assert_eq!(
+            individual.virtual_leds_per_port(),
+            groups.virtual_leds_per_port(),
+            "{what}: virtual LEDs differ"
+        );
+        assert_eq!(individual.bytes_per_port(), groups.bytes_per_port(), "{what}: bytes differ");
+        assert_eq!(
+            individual.universes_per_port(),
+            groups.universes_per_port(),
+            "{what}: universes differ"
+        );
+        assert_eq!(
+            individual.universe_offset(),
+            groups.universe_offset(),
+            "{what}: offsets differ"
+        );
+        assert_eq!(
+            individual.bound_universes(),
+            groups.bound_universes(),
+            "{what}: bound universes differ — this is what ArtPollReply advertises"
+        );
+        assert_eq!(
+            individual.mirror_group_count(),
+            groups.mirror_group_count(),
+            "{what}: mirror item count differs"
+        );
+        assert_eq!(
+            individual.mirror_group_size(),
+            groups.mirror_group_size(),
+            "{what}: mirror per-port sizes differ"
+        );
+    }
+}
+
+#[test]
+fn individual_ignores_the_stored_sizes_and_groups_does_not() {
+    // Guards the other direction: that the two modes are genuinely distinct and
+    // the test above is not passing because grouping is being ignored entirely.
+    let base = all(120, 4, SmartLedColorMode::Rgb);
+    let groups = with_grouping(base, LedGrouping::Groups, false);
+    let individual = with_grouping(base, LedGrouping::Individual, false);
+
+    assert_eq!(groups.effective_group_size(0), 4, "Groups uses the stored size");
+    assert_eq!(individual.effective_group_size(0), 1, "Individual pins it to 1");
+    assert_eq!(groups.virtual_leds_per_port()[0], 30, "120 LEDs grouped by 4");
+    assert_eq!(individual.virtual_leds_per_port()[0], 120, "one item per pixel");
+}
+
+#[test]
+fn fixtures_uses_its_own_default_rather_than_the_stored_group_sizes() {
+    // An early version fell back to `Groups` when no map was stored. That was
+    // rejected as hidden state: nothing on the panel told you whether a port
+    // was unconfigured or deliberately set to mimic another mode. An
+    // unconfigured port now shows and uses one `F001`, which is visible and
+    // editable.
+    let base = all(120, 4, SmartLedColorMode::Rgb);
+    let groups = with_grouping(base, LedGrouping::Groups, false);
+    let fixtures = with_grouping(base, LedGrouping::Fixtures, false);
+
+    assert_eq!(groups.virtual_leds_per_port()[0], 30, "120 LEDs grouped by 4");
+    assert_eq!(fixtures.virtual_leds_per_port()[0], 1, "one default run");
+    // Per-port BYTES, not universes: both round up to one universe per port, so
+    // the universe count cannot tell the two apart and asserting on it would
+    // have proved nothing.
+    assert_eq!(groups.bytes_per_port()[0], 90, "30 items, RGB");
+    assert_eq!(fixtures.bytes_per_port()[0], 3, "one item, RGB");
 }

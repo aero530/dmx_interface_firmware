@@ -82,8 +82,18 @@ embedded-hal-async = "1.0"
 # Read/Write traits for embassy-rp's BufferedUart (the FT232RL widget port);
 # 0.7 is the version embassy-rp 0.10 implements.
 embedded-io-async = "0.7"
-embassy-usb = { version = "0.6.0", features = ["defmt"] }
-embassy-usb-logger = "0.6.0"
+# `max-interface-count` defaults to **4**, and every CDC-ACM function is *two*
+# interfaces (communication + data). The default build is the Enttec widget plus
+# the console = 4, exactly at the limit; `--features usb` adds the log interface
+# = 6, and the fifth `push` trips an `assert!` inside `Builder`. That panic is a
+# hard fault on a board with no debugger, so it looks like the firmware does not
+# boot at all rather than like a USB fault - which is how it read on the bench,
+# 2026-09-17. 8 leaves room for a fourth function without a second hunt.
+embassy-usb = { version = "0.6.0", features = [
+    "defmt",
+    "max-interface-count-8",
+    "max-handler-count-8",
+] }
 heapless = { version = "0.9", default-features = false }
 embassy-embedded-hal = { version = "0.6.0", features = ["defmt"] }
 rand_core = "0.9.3"

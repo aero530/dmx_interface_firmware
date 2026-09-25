@@ -33,16 +33,16 @@ cfg_if! {
 
 use alloc::format;
 
-use embassy_rp::peripherals;
-use embassy_rp::usb::Driver;
-use embassy_usb::class::cdc_acm::CdcAcmClass;
+use crate::usb_toggle::UsbClass;
 use embassy_usb::driver::EndpointError;
 
 use crate::channels::{GlobalDataChannelRx, RouterChannelTx, CHANNEL_EEPROM};
 use crate::event_router::{buffer_index, GlobalData, RouterEvent};
 use crate::ui::{all_fields, ModuleType};
 use crate::{DMX_BUFFER, DMX_UNIVERSE_SIZE};
+use common::buffers::{fixture_map, set_fixture_map};
 use common::events::EepromEvent;
+use common::ui::ModuleSettings;
 
 /// Parse `aa:bb:cc:dd:ee:ff` (or `-` separated) into a unicast MAC.
 ///
@@ -71,7 +71,6 @@ fn parse_mac(text: &str) -> Result<[u8; 6], &'static str> {
     Ok(mac)
 }
 
-type UsbClass<'d> = CdcAcmClass<'d, Driver<'d, peripherals::USB>>;
 
 /// Serve the console protocol forever (reconnecting across USB sessions).
 pub async fn run(class: &mut UsbClass<'_>, router_tx: RouterChannelTx, mut global_rx: GlobalDataChannelRx) -> ! {
@@ -186,8 +185,18 @@ async fn handle_line(
     match command {
         "get" => {
             let data = current(global_rx);
+            // One snapshot for the whole listing, so a layout edited part-way
+            // through cannot be reported half one way and half the other.
+            let fixtures = fixture_map();
             for field in all_fields() {
-                respond(class, &format!("{}={}\n", field.key(), field.display(&data.menu_settings))).await?;
+                let value = if field.fixture_slot().is_some() {
+                    // Not in `MenuData` - `display()` would render the `----`
+                    // placeholder. See `FieldId::fixture_display`.
+                    field.fixture_display(&fixtures)
+                } else {
+                    field.display(&data.menu_settings)
+                };
+                respond(class, &format!("{}={}\n", field.key(), value)).await?;
             }
             respond(class, "ok\n").await?;
         }
@@ -200,6 +209,21 @@ async fn handle_line(
             } else {
                 match all_fields().find(|f| f.key() == key) {
                     None => Err("unknown key"),
+                    Some(field) if field.fixture_slot().is_some() => {
+                        // Same shape as below - parse onto a scratch copy first,
+                        // so a rejected value leaves the live map untouched.
+                        let (port, _) = field.fixture_slot().unwrap_or((0, 0));
+                        let ModuleSettings::SmartLed(led) = current(global_rx).menu_settings.module;
+                        let port_leds = led.leds_per_port[port.min(led.leds_per_port.len() - 1)];
+
+                        let mut map = fixture_map();
+                        field.fixture_set_from_str(&mut map, port_leds, value).map(|()| {
+                            set_fixture_map(map);
+                            // Payload-free: the task reads the static, so a
+                            // second edit overtaking this one is harmless.
+                            let _ = CHANNEL_EEPROM.try_send(EepromEvent::WriteFixtures);
+                        })
+                    }
                     Some(field) => {
                         // Validate/parse onto a scratch copy, then have the
                         // router merge only this field into its authoritative
@@ -271,6 +295,14 @@ async fn handle_line(
             respond(class, &format!("boot={:?}\n", data.boot_status)).await?;
             // Display / expander bring-up steps reached so far (see diag.rs).
             respond(class, &format!("diag={}\n", crate::diag::text())).await?;
+            // The USB-power path as the expander last read it. `rpi_vbus=1`
+            // with no `Module USB also powers LEDs` note on the panel means
+            // the detect is fine and the UI is not - see `tft_ui.rs`.
+            let mut pwr = heapless::String::<80>::new();
+            common::usb_power::status_text(&mut pwr);
+            respond(class, &format!("pwr={}\n", pwr)).await?;
+            // The rail the module's buck runs from. 0 = no reading yet.
+            respond(class, &format!("vsys={} mV\n", crate::supervisor::vsys_mv())).await?;
             respond(class, "ok\n").await?;
         }
 

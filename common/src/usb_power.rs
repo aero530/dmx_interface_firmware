@@ -16,7 +16,7 @@
 //! overcurrent or a reverse-voltage event, and it only re-arms when EN is
 //! toggled.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 
 /// What the user asked for on the System page.
 pub const MODE_EXTERNAL: u8 = 0;
@@ -37,6 +37,13 @@ pub const ST_RPI_VBUS: u8 = 1 << 2;
 pub const ST_FAULT: u8 = 1 << 3;
 
 static STATUS: AtomicU8 = AtomicU8::new(0);
+
+/// The scale factor the LED task last applied, published so the UI can say so.
+///
+/// Without this the panel can tell you the brick is the supply but not that the
+/// frame is being held back, and dim strips look like a fault rather than the
+/// budget working. Unity until the first frame is rendered.
+static SCALE: AtomicU16 = AtomicU16::new(256);
 
 /// Current-limit headroom, in milliamps, for the strips when they run from the
 /// brick. The switch itself limits at ≈ 1.45 A (R37 = 18 k) and latches off;
@@ -71,6 +78,50 @@ pub fn set_status(bits: u8) {
 
 pub fn status() -> u8 {
     STATUS.load(Ordering::Relaxed)
+}
+
+/// One-line summary of the whole USB-power path, for the console.
+///
+/// Exists because until 2026-09-21 none of this was visible anywhere but the
+/// title row and the `LED Power` note. When the note failed to appear on the
+/// bench there was no way to tell a dead present-detect from a display bug,
+/// which is the kind of blind spot that costs an afternoon.
+///
+/// `mode` is what the menu asks for; `en`/`ftdi`/`rpi`/`flt` are P04–P07 as the
+/// button task last read them; `scale` is what the LED task last applied.
+pub fn status_text(out: &mut heapless::String<80>) {
+    use core::fmt::Write as _;
+    let s = status();
+    let bit = |b: u8| if s & b != 0 { 1 } else { 0 };
+    let _ = write!(
+        out,
+        "mode={} en={} ftdi_vbus={} rpi_vbus={} fault={} scale={}%",
+        if brick_selected() { "usb_brick" } else { "external" },
+        bit(ST_ENABLED),
+        bit(ST_FTDI_VBUS),
+        bit(ST_RPI_VBUS),
+        bit(ST_FAULT),
+        scale_percent()
+    );
+}
+
+/// Called by the LED task once per frame with whatever [`budget_scale`] gave it.
+pub fn set_scale(scale: u16) {
+    SCALE.store(scale, Ordering::Relaxed);
+}
+
+/// The last applied scale, 0..=256 where 256 is unity.
+pub fn scale() -> u16 {
+    SCALE.load(Ordering::Relaxed)
+}
+
+/// The last applied scale as whole percent, for display. 100 means the budget
+/// is not biting.
+///
+/// Rounds **down**, so a frame held at 99.6 % reads 99 and not 100: the panel
+/// should not claim full output while anything is being taken off.
+pub fn scale_percent() -> u8 {
+    (scale().min(256) as u32 * 100 / 256) as u8
 }
 
 /// True while the strips are actually being fed from the brick — the setting

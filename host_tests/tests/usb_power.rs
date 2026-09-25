@@ -86,3 +86,28 @@ fn scaling_is_monotonic_in_demand() {
         last = scale;
     }
 }
+
+#[test]
+fn the_displayed_percentage_never_rounds_up_to_full() {
+    use common::usb_power::{scale, scale_percent, set_scale};
+
+    // The panel shows this beside `PWR usb`, and hides it at 100. Anything
+    // being held back must therefore never read as 100, or dim strips would
+    // once again have no explanation on screen.
+    set_scale(256);
+    assert_eq!(scale(), 256);
+    assert_eq!(scale_percent(), 100, "unity is the one case that may say 100");
+
+    set_scale(255);
+    assert_eq!(scale_percent(), 99, "just under unity must not round up");
+
+    set_scale(86); // 64 full-white RGB pixels against the 1300 mA budget
+    assert_eq!(scale_percent(), 33);
+
+    set_scale(1); // the floor `scale_for_sum` clamps to
+    assert_eq!(scale_percent(), 0, "still visible as 'something is very wrong'");
+
+    // Out of range cannot overflow the u8 or claim more than full output.
+    set_scale(u16::MAX);
+    assert_eq!(scale_percent(), 100);
+}

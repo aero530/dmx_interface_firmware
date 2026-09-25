@@ -1,6 +1,7 @@
 //! Types used in the user interface
 use core::net::Ipv4Addr;
 
+use crate::ui::fixtures::FixtureMap;
 use crate::{DMX_UNIVERSE_COUNT, DMX_UNIVERSE_SIZE, SMARTLED_PORT_COUNT};
 use bincode::{Decode, Encode};
 // use embassy_net::IpAddress;
@@ -188,6 +189,10 @@ pub struct SmartLedSettings {
     pub color_mode: SmartLedColorMode,
     pub port_mode: SmartLedPortMode,
     pub dmx_group_size: SmartLedDmxGroupSize,
+    /// How a strip is carved into addressable items. Appended for schema 5;
+    /// `MenuData` is bincode with no self-describing header, so new fields go
+    /// on the end.
+    pub grouping: LedGrouping,
 }
 
 /// LEDs per port a fresh unit assumes. Non-zero so a first power-up with strips
@@ -202,23 +207,203 @@ impl Default for SmartLedSettings {
             color_mode: SmartLedColorMode::default(),
             port_mode: SmartLedPortMode::default(),
             dmx_group_size: SmartLedDmxGroupSize::default(),
+            grouping: LedGrouping::default(),
         }
     }
 }
 
+/// The derived geometry of all eight ports: how a strip is carved up, how many
+/// DMX channels that costs, and where each port sits in the buffer.
+///
+/// Borrows the settings **and** the fixture map because the two together decide
+/// the answer. Build one and call several methods; they share work through the
+/// same chain (`virtual_leds_per_port` → `bytes_per_port` → `universes_per_port`
+/// → the rest), so a single figure computed here is consistent across all of
+/// them by construction.
+pub struct PortLayout<'a> {
+    settings: &'a SmartLedSettings,
+    fixtures: &'a FixtureMap,
+}
+
 impl SmartLedSettings {
-    /// Return the number of virtual LEDs on each port.
-    /// The number of virtual LEDs is calcuated based the number of physical LEDs
-    /// and the grouping size for each port.
+    /// Geometry for these settings against a given fixture map.
+    pub fn layout<'a>(&'a self, fixtures: &'a FixtureMap) -> PortLayout<'a> {
+        PortLayout { settings: self, fixtures }
+    }
+}
+
+impl PortLayout<'_> {
+    /// The group size a port actually uses, after [`LedGrouping`] has had its
+    /// say. **Every read of `dmx_group_size` should come through here.**
+    ///
+    /// `Individual` is not a separate layout - it is `Groups` with the size
+    /// pinned to 1, which is also the shipping default. Routing it through one
+    /// accessor is what makes that identity true by construction rather than by
+    /// two code paths agreeing: the alternative, a bespoke 1:1 rule, silently
+    /// changed `Mirror` (which stretches proportionally, so a 200-LED port
+    /// mirroring a 100-LED port groups by 2) and would have darkened half of it
+    /// one toggle from defaults.
+    ///
+    /// `Fixtures` has no single size; callers that care must consult the
+    /// fixture map. This returns the stored `Groups` value for it so the
+    /// universe maths keeps working until that lands.
+    pub fn effective_group_size(&self, port: usize) -> u16 {
+        match self.settings.grouping {
+            LedGrouping::Individual => 1,
+            LedGrouping::Groups | LedGrouping::Fixtures => {
+                self.settings.dmx_group_size.0[port.min(SMARTLED_PORT_COUNT - 1)]
+            }
+        }
+    }
+
+    /// Addressable items each port carries — the quantity every byte and
+    /// universe figure below is built on.
+    ///
+    /// **This is the one method fixtures change.** Everything else reaches them
+    /// through it, which is why the whole chain had to move onto this type: a
+    /// method on `SmartLedSettings` cannot see a map stored outside it, and
+    /// would have gone on quietly returning the `Groups` answer.
+    ///
+    /// Integer `div_ceil` rather than the f32 `ceil()` this replaced: identical
+    /// for every value in range, and it cannot produce the NaN a zero group size
+    /// used to (`host_tests/tests/types.rs` documents that hazard).
     pub fn virtual_leds_per_port(&self) -> [u16; SMARTLED_PORT_COUNT] {
-        self.leds_per_port
-            .iter()
-            .zip(self.dmx_group_size.0.iter())
-            .map(|(led_count, grouping)| (*led_count as f32 / *grouping as f32).ceil() as u16)
-            .collect::<Vec<u16, SMARTLED_PORT_COUNT>>()
-            .as_slice()
-            .try_into()
-            .unwrap_or_default()
+        core::array::from_fn(|port| self.items_on(port))
+    }
+
+    /// Where item `item` lands on `port`, as `(start, leds)` zero-based.
+    ///
+    /// The one place the two layouts converge: a uniform group is
+    /// `(item * size, size)`, a fixture is its run from the map. Every caller
+    /// that paints works in these terms and needs to know nothing else, which
+    /// is what keeps the render one loop rather than a branch per mode.
+    ///
+    /// `None` when the port has no such item.
+    pub fn item_span(&self, port: usize, item: usize) -> Option<(u16, u16)> {
+        if self.settings.grouping == LedGrouping::Fixtures {
+            // Gaps advance the cursor inside `spans` without yielding, so item
+            // N is the Nth *lit* run wherever the gaps fall. A port with
+            // nothing stored uses `FixtureMap::DEFAULT_ENTRY`, not its group
+            // size - see that constant for why.
+            return self.fixtures.spans(port).nth(item);
+        }
+        if item >= self.items_on(port) as usize {
+            return None;
+        }
+        let size = self.effective_group_size(port).max(1);
+        Some(((item as u16).saturating_mul(size), size))
+    }
+
+    /// Addressable items [`SmartLedPortMode::Mirror`] shows, set by port 1
+    /// whatever the layout is.
+    pub fn mirror_items(&self) -> u16 {
+        if self.settings.grouping == LedGrouping::Fixtures {
+            return self.items_on(0);
+        }
+        self.mirror_group_count()
+    }
+
+    /// Where item `item` lands on `port` under [`SmartLedPortMode::Mirror`].
+    ///
+    /// Every port shows the same items; what differs is the geometry each one
+    /// applies to them.
+    ///
+    /// * **Fixtures** - the port's own list, so a mirrored rig can have
+    ///   differently-built strips showing the same content.
+    /// * **Groups / Individual** - the proportionally scaled size from
+    ///   [`Self::mirror_group_size`], unchanged from before fixtures existed and
+    ///   guarded by the exhaustive identical-ports test in
+    ///   `host_tests/tests/mirror.rs`.
+    pub fn mirror_item_span(&self, port: usize, item: usize) -> Option<(u16, u16)> {
+        if self.settings.grouping == LedGrouping::Fixtures {
+            return self.fixtures.spans(port).nth(item);
+        }
+        let size = self.mirror_group_size()[port.min(SMARTLED_PORT_COUNT - 1)];
+        Some(((item as u16).saturating_mul(size), size))
+    }
+
+    /// Items on one port.
+    fn items_on(&self, port: usize) -> u16 {
+        if self.settings.grouping == LedGrouping::Fixtures {
+            if self.settings.leds_per_port[port] == 0 {
+                // A port with no LEDs costs no channels. Without this the
+                // default entry would reserve a universe slot for a strip that
+                // does not exist.
+                return 0;
+            }
+            // Gaps consume LEDs but no channels, so only lit runs count.
+            return self.fixtures.fixture_count(port);
+        }
+        self.settings.leds_per_port[port].div_ceil(self.effective_group_size(port).max(1))
+    }
+
+    /// Port 1's group size as Mirror can actually use it.
+    ///
+    /// A port cannot group more LEDs than it has, and a stored zero - only
+    /// reachable from a corrupt EEPROM, since the menu floor is 1 - would
+    /// divide by zero in both callers.
+    fn mirror_first_size(&self) -> u16 {
+        self.effective_group_size(0).min(self.settings.leds_per_port[0]).max(1)
+    }
+
+    /// How many addressable items [`SmartLedPortMode::Mirror`] shows, set by
+    /// port 1.
+    ///
+    /// **Rounds down**, unlike [`Self::virtual_leds_per_port`], which rounds up
+    /// so that no LED goes unaddressed. Mirror cannot round up: the ragged last
+    /// group is a partial group on port 1 but a *full* one on every other port,
+    /// so rounding up makes two identical strips render differently. 64 LEDs
+    /// grouped by 3 is **21** items, not 22. Found on the bench 2026-09-17:
+    /// with 22, a second identical 64-LED port computed `64 / 22 = 2` and lit
+    /// 44 LEDs beside port 1's 64.
+    ///
+    /// The odd LED left on the end goes dark - the same rounding rule
+    /// [`Self::mirror_group_size`] applies to every port.
+    pub fn mirror_group_count(&self) -> u16 {
+        (self.settings.leds_per_port[0] / self.mirror_first_size()).max(1)
+    }
+
+    /// Group size each port uses in [`SmartLedPortMode::Mirror`].
+    ///
+    /// Every port shows the same **addressable items**, so a port with twice
+    /// port 1's LEDs groups by twice as much: the size scales with the length,
+    /// `size_n = leds_n * size_1 / leds_1`. Port 1 with 24 LEDs grouped by 4 is
+    /// six items, so a 12-LED port mirrors it grouped by 2 and a 48-LED port
+    /// grouped by 8 - the same six items, each stretched to the strip it is on.
+    ///
+    /// **Scaled from port 1, not divided by the item count.** The two agree
+    /// whenever port 1's group size divides its LED count, which is the case
+    /// every worked example above is. Where they disagree, scaling is the one
+    /// that keeps the mode's promise: 10 LEDs grouped by 4 is two items, and
+    /// `leds / items` on a second identical port gives `10 / 2 = 5` against
+    /// port 1's 4 - the same strip, configured the same way, rendered
+    /// differently. Scaling returns port 1's own size for any port of port 1's
+    /// length, by construction, which is what a mirror has to do.
+    ///
+    /// **Rounds down.** 50 LEDs mirroring 24-grouped-by-4 is 8.33, so the port
+    /// groups by 8 and covers 48; the two LEDs on the end stay dark rather than
+    /// making one group visibly longer than the rest. A port too short to fill
+    /// even one item is floored at 1 instead of collapsing to zero - it shows
+    /// as many of the leading items as it has LEDs.
+    ///
+    /// Port 1 keeps its configured size, clamped only by its own LED count, and
+    /// in `Individual` mode none of this is used: the configured sizes stand.
+    pub fn mirror_group_size(&self) -> [u16; SMARTLED_PORT_COUNT] {
+        let first_size = self.mirror_first_size() as u32;
+        let first_leds = self.settings.leds_per_port[0].max(1) as u32;
+        // Seeded from the effective sizes so `Individual` mirrors as
+        // size-1-everywhere would, rather than from the stored values it hides.
+        let mut sizes = self.settings.dmx_group_size.0;
+        for (port, size) in sizes.iter_mut().enumerate() {
+            *size = self.effective_group_size(port);
+        }
+        sizes[0] = first_size as u16;
+        for (port, size) in sizes.iter_mut().enumerate().skip(1) {
+            // In u32: 600 LEDs scaled by a 600 group overflows u16 on the way.
+            let scaled = self.settings.leds_per_port[port] as u32 * first_size / first_leds;
+            *size = scaled.max(1) as u16;
+        }
+        sizes
     }
 
     /// Bytes each port puts on the wire per frame: virtual LEDs x colour width.
@@ -228,7 +413,7 @@ impl SmartLedSettings {
     pub fn bytes_per_port(&self) -> [u16; SMARTLED_PORT_COUNT] {
         self.virtual_leds_per_port()
             .iter()
-            .map(|n| n.saturating_mul(self.color_mode.addr_size() as u16))
+            .map(|n| n.saturating_mul(self.settings.color_mode.addr_size() as u16))
             .collect::<Vec<u16, SMARTLED_PORT_COUNT>>()
             .as_slice()
             .try_into()
@@ -250,6 +435,23 @@ impl SmartLedSettings {
             .unwrap_or_default()
     }
 
+    /// DMX channels the configuration actually uses.
+    ///
+    /// **Not the span it occupies.** Ports start on universe boundaries, so a
+    /// configuration using 90 channels on each of eight ports reaches into
+    /// eight universes while using 720 channels. This is the smaller number —
+    /// what a console operator patches — and `Universes` beside it is the
+    /// larger one.
+    ///
+    /// Under `Mirror` every port reads the same block, so it is counted once.
+    pub fn total_channels(&self) -> u32 {
+        let bytes = self.bytes_per_port();
+        match self.settings.port_mode {
+            SmartLedPortMode::Individual => bytes.iter().map(|b| *b as u32).sum(),
+            SmartLedPortMode::Mirror => bytes[0] as u32,
+        }
+    }
+
     /// Universes consumed across every port.
     pub fn total_universes(&self) -> u16 {
         self.universes_per_port().iter().sum()
@@ -269,7 +471,7 @@ impl SmartLedSettings {
     /// Universes the configuration consumes from its base: every port's block
     /// in `Individual` mode, one shared block (port 1's) in `Mirror` mode.
     pub fn bound_universes(&self) -> u16 {
-        match self.port_mode {
+        match self.settings.port_mode {
             SmartLedPortMode::Individual => self.total_universes(),
             SmartLedPortMode::Mirror => self.universes_per_port()[0],
         }
@@ -294,6 +496,71 @@ impl SmartLedSettings {
             .as_slice()
             .try_into()
             .unwrap_or_default()
+    }
+}
+
+
+/// Geometry against the **live** fixture map.
+///
+/// These landed reading `FixtureMap::EMPTY`, so that the Phase 2 refactor
+/// changed no call sites. That was fine until fixtures existed and then it was
+/// a bug: every one of these is on a path that must honour the map, and all six
+/// were quietly reporting the layout of an empty one. It showed up as a channel
+/// count of 6 where the rig used 9 — and, less visibly, as the wrong universe
+/// count in the BindIndex ArtPollReply that controllers auto-patch from.
+///
+/// Reading the global here is the honest shape: at runtime there is exactly one
+/// map, it is the single source of truth, and a caller with nothing else to say
+/// should get it. A caller that needs to reason about a *hypothetical* map -
+/// the tests, an edit in progress - builds a [`PortLayout`] explicitly.
+impl SmartLedSettings {
+    pub fn effective_group_size(&self, port: usize) -> u16 {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).effective_group_size(port)
+    }
+    pub fn virtual_leds_per_port(&self) -> [u16; SMARTLED_PORT_COUNT] {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).virtual_leds_per_port()
+    }
+    pub fn mirror_group_count(&self) -> u16 {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).mirror_group_count()
+    }
+    pub fn mirror_group_size(&self) -> [u16; SMARTLED_PORT_COUNT] {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).mirror_group_size()
+    }
+    pub fn bytes_per_port(&self) -> [u16; SMARTLED_PORT_COUNT] {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).bytes_per_port()
+    }
+    pub fn universes_per_port(&self) -> [u16; SMARTLED_PORT_COUNT] {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).universes_per_port()
+    }
+    pub fn total_universes(&self) -> u16 {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).total_universes()
+    }
+    pub fn total_channels(&self) -> u32 {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).total_channels()
+    }
+    pub fn ports_over_budget(&self) -> bool {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).ports_over_budget()
+    }
+    pub fn bound_universes(&self) -> u16 {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).bound_universes()
+    }
+    pub fn over_budget(&self) -> bool {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).over_budget()
+    }
+    pub fn universe_offset(&self) -> [u16; SMARTLED_PORT_COUNT] {
+        let live = crate::buffers::fixture_map();
+        self.layout(&live).universe_offset()
     }
 }
 /// Impl increment and decrement for u8
@@ -521,13 +788,58 @@ impl core::fmt::Display for SmartLedColorMode {
     }
 }
 
-/// Smart LED port mode
+/// How a strip is carved into addressable items.
+///
+/// Orthogonal to [`SmartLedPortMode`], which decides whether ports *share* a
+/// DMX block rather than how any one of them is divided. Both axes stay
+/// independently useful: a fixture layout can be mirrored across ports.
+///
+/// `Groups` is the default so an existing board behaves exactly as it did -
+/// with `dmx_group_size` defaulting to 1, `Groups` and `Individual` are the
+/// same picture on a fresh unit.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Ordinalize, Format, Debug, Decode, Encode)]
+pub enum LedGrouping {
+    /// One DMX channel set per pixel. Exactly `Groups` with every size at 1.
+    Individual,
+    #[default]
+    /// A uniform run length per port, from `dmx_group_size`.
+    Groups,
+    /// A per-port ordered list of runs, each a length and a fixture/gap flag.
+    Fixtures,
+}
+
+impl IncDec for LedGrouping {
+    fn increment(&self, _index: usize) -> Self {
+        Self::from_ordinal(self.ordinal().saturating_add(1)).unwrap_or(LedGrouping::Individual)
+    }
+
+    fn decrement(&self, _index: usize) -> Self {
+        Self::from_ordinal(self.ordinal().saturating_sub(1)).unwrap_or(LedGrouping::Fixtures)
+    }
+}
+
+impl core::fmt::Display for LedGrouping {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            LedGrouping::Individual => write!(f, "Individual"),
+            LedGrouping::Groups => write!(f, "Groups"),
+            LedGrouping::Fixtures => write!(f, "Fixtures"),
+        }
+    }
+}
+
+/// Whether the eight ports share one DMX block.
+///
+/// Shown on the panel as `Mirror Ports: Off/On` - the variant names predate
+/// [`LedGrouping`] and are kept because they are the on-EEPROM ordinals and the
+/// console spellings. "Individual" here has never meant what it means there:
+/// this is about ports, that is about pixels.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Ordinalize, Format, Debug, Decode, Encode)]
 pub enum SmartLedPortMode {
     #[default]
-    /// Individual - DMX size = SUM(#leds/port) / DmxGroupSize * color width
+    /// Every port gets its own DMX block.
     Individual,
-    /// Mirror - DMX size = MAX(#leds/port) / DmxGroupSize * color width
+    /// One block (port 1's) drives all eight.
     Mirror,
 }
 
@@ -551,9 +863,12 @@ impl IncDec for SmartLedPortMode {
 
 impl core::fmt::Display for SmartLedPortMode {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        // Reads as the answer to "Mirror Ports?", which is what the label asks.
+        // Saying "Individual" here would collide with `LedGrouping::Individual`
+        // on the same page, meaning something else entirely.
         match self {
-            SmartLedPortMode::Individual => write!(f, "Individual"),
-            SmartLedPortMode::Mirror => write!(f, "Mirror"),
+            SmartLedPortMode::Individual => write!(f, "Off"),
+            SmartLedPortMode::Mirror => write!(f, "On"),
         }
     }
 }

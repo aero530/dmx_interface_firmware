@@ -31,6 +31,7 @@ extern crate alloc;
 pub mod constants;
 pub use constants::*;
 
+pub mod activity;
 pub mod artnet;
 pub mod enttec_protocol;
 pub mod buffers;

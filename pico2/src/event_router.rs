@@ -58,8 +58,13 @@ pub async fn event_router(mut router: Router) {
         // Event-driven: wake on whichever channel has data, or on the tick.
         match select3(router.channel.receive(), router.channel_dmx.receive(), ticker.next()).await {
             Either3::First(message) => router.process_router_event(message).await,
-            // Note the arrival; the render waits for the tick.
-            Either3::Second(message) => pending = Some(message),
+            // Note the arrival; the render waits for the tick. The activity
+            // mark is set here rather than in each input task because this is
+            // the one place every input's frame passes through.
+            Either3::Second(message) => {
+                common::activity::mark();
+                pending = Some(message);
+            }
             Either3::Third(()) => {
                 if let Some(message) = pending.take() {
                     router.process_dmx_event(message).await;

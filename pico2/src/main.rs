@@ -26,7 +26,18 @@ extern crate alloc;
 pub use common::constants::*;
 pub use common::{channels, enttec_protocol, ui, DMX_BUFFER, LED_COLORS};
 
-use defmt::*;
+// Logging goes wherever the build says: `defmt` over RTT by default, the
+// `log` crate over USB with `--features usb`. Format strings therefore have
+// to parse as both - no `{=type}` hints. See `usb_log.rs`.
+use cfg_if::cfg_if;
+cfg_if! {
+    if #[cfg(feature = "usb")] {
+        use log::{error, info, warn};
+    } else {
+        use defmt::{error, info, warn};
+    }
+}
+use defmt::unwrap;
 use defmt_rtt as _;
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::adc::{self, Adc};
@@ -60,6 +71,7 @@ mod buttons;
 mod console_usb;
 mod diag;
 mod ftdi;
+mod glyphs;
 mod netstats;
 mod spi_coalesce;
 mod dmx;
@@ -71,6 +83,7 @@ mod event_router;
 mod m24x02;
 mod panel_test;
 mod pca9633;
+mod pixfont;
 mod sacn_rx;
 mod smart_led;
 mod identity;
@@ -78,6 +91,10 @@ mod supervisor;
 mod tca9555;
 mod tft_ui;
 mod usb_device;
+/// `log` sink for the `usb` build; see the module docs.
+#[cfg(feature = "usb")]
+mod usb_log;
+mod usb_toggle;
 mod w6300;
 mod ws2812;
 use smart_led::Ws2812Outputs;
@@ -279,6 +296,12 @@ async fn boot_task(
     Timer::after_millis(50).await;
     channels::CHANNEL_EEPROM.send(EepromEvent::ReadSettings).await;
     Timer::after_millis(50).await;
+    // After the settings, because `grouping` decides whether the map is
+    // consulted at all. An unreadable or absent map is not an error: every port
+    // falls back to its group size, so a board that has never had fixtures set
+    // behaves exactly as it did before.
+    channels::CHANNEL_EEPROM.send(EepromEvent::ReadFixtures).await;
+    Timer::after_millis(50).await;
 
     let _ = channels::CHANNEL.try_send(RouterEvent::GetBootStatus(ReturnChannel::Main));
     let prev_boot = match with_timeout(Duration::from_millis(250), channels::CHANNEL_MAIN.receiver().receive()).await {
@@ -439,6 +462,10 @@ fn main() -> ! {
     }
 
     let p = embassy_rp::init(Default::default());
+    // Before anything logs: the sink buffers until a host opens the port, so
+    // installing it here is what makes the boot log readable at all.
+    #[cfg(feature = "usb")]
+    usb_log::init(log::LevelFilter::Info);
     info!("DMX interface starting on RP2350");
 
     // ---- Watchdog ---------------------------------------------------------
@@ -624,7 +651,7 @@ fn main() -> ! {
             channels::CHANNEL_LOG.receiver()
         ))));
         s.spawn(unwrap!(usb_device::usb_device_task(
-            UsbDriver::new(p.USB, Irqs),
+            usb_toggle::UsbDriver::new(UsbDriver::new(p.USB, Irqs)),
             channels::CHANNEL_DMX.sender(),
             unwrap!(channels::CHANNEL_DMX_FEEDBACK.receiver()),
             channels::CHANNEL.sender(),

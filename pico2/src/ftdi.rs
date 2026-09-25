@@ -49,6 +49,14 @@
 //! see the device, that request is the first thing to make real.
 
 use cfg_if::cfg_if;
+// Two logging backends, so every format string in this file has to parse as
+// **both** `defmt` and `core::fmt`. That rules out defmt's type hints -
+// `{=u8:#04x}` builds here by default and fails `--features usb`, which is how
+// it got through once (2026-09-17). Display hints are safe: defmt takes `#`,
+// then zero-padding, then the type, in `core::fmt`'s order and with the same
+// meaning, so `{:#04x}` is right in either. Files that log through `defmt::*`
+// directly - `w6300.rs`, `eeprom.rs` - have no such constraint. Build both
+// variants before calling a change to this file done.
 cfg_if! {
     if #[cfg(feature = "usb")] {
         use log::{info, warn};
@@ -60,8 +68,7 @@ cfg_if! {
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_futures::select::{Either, select};
-use embassy_rp::peripherals;
-use embassy_rp::usb::Driver;
+use crate::usb_toggle::UsbDriver;
 use embassy_time::Timer;
 use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::driver::{Direction, Endpoint, EndpointAddress, EndpointError, EndpointIn, EndpointOut};
@@ -151,7 +158,7 @@ impl Handler for FtdiControl {
                 Some(OutResponse::Accepted)
             }
             other => {
-                warn!("FTDI: unhandled vendor OUT request {=u8:#04x}", other);
+                warn!("FTDI: unhandled vendor OUT request {:#04x}", other);
                 // Still accept: an unknown request is far more likely to be one
                 // this emulation has not met than a real error, and a rejection
                 // aborts the host's open.
@@ -185,7 +192,7 @@ impl Handler for FtdiControl {
                 Some(InResponse::Accepted(&buf[..2]))
             }
             other => {
-                warn!("FTDI: unhandled vendor IN request {=u8:#04x}", other);
+                warn!("FTDI: unhandled vendor IN request {:#04x}", other);
                 Some(InResponse::Rejected)
             }
         }
@@ -224,7 +231,7 @@ async fn send<E: EndpointIn>(ep: &mut E, bytes: &[u8]) -> Result<(), EndpointErr
 /// Never returns: `usb.run()` and the protocol loop are joined for the life of
 /// the board, exactly as the CDC path in `usb_device.rs` does.
 pub async fn run(
-    driver: Driver<'static, peripherals::USB>,
+    driver: UsbDriver,
     tx: DmxChannelTx,
     mut rx: DmxFeedbackChannelRx,
     serial: &'static str,
@@ -286,7 +293,7 @@ pub async fn run(
     };
 
     let mut usb = builder.build();
-    info!("FTDI: emulating FT232R {=u16:#06x}:{=u16:#06x} as ENTTEC / DMX USB PRO", FTDI_VID, FTDI_PID);
+    info!("FTDI: emulating FT232R {:#06x}:{:#06x} as ENTTEC / DMX USB PRO", FTDI_VID, FTDI_PID);
 
     let protocol = async {
         let mut parser = EnttecParser::new();

@@ -29,7 +29,17 @@ use common::event_router::{DmxEvent, DmxFeedbackEvent, PacketAddress};
 use common::artnet::PortAddress;
 use common::ui::InputMode;
 use common::{DMX_BUFFER, DMX_UNIVERSE_SIZE};
-use defmt::*;
+// Logging goes wherever the build says: `defmt` over RTT by default, the
+// `log` crate over USB with `--features usb`. Format strings therefore have
+// to parse as both - no `{=type}` hints. See `usb_log.rs`.
+use cfg_if::cfg_if;
+cfg_if! {
+    if #[cfg(feature = "usb")] {
+        use log::{info, warn};
+    } else {
+        use defmt::{info, warn};
+    }
+}
 use embassy_rp::gpio::Output;
 use embassy_rp::peripherals::PIO2;
 use embassy_time::{with_timeout, Duration};

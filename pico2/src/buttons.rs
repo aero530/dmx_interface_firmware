@@ -20,7 +20,17 @@ use common::channels::RouterChannelTx;
 use common::event_router::RouterEvent;
 use common::events::{KeyPadButton, KeyPadEvent};
 use common::usb_power;
-use defmt::*;
+// Logging goes wherever the build says: `defmt` over RTT by default, the
+// `log` crate over USB with `--features usb`. Format strings therefore have
+// to parse as both - no `{=type}` hints. See `usb_log.rs`.
+use cfg_if::cfg_if;
+cfg_if! {
+    if #[cfg(feature = "usb")] {
+        use log::{error, info, warn};
+    } else {
+        use defmt::{error, info, warn};
+    }
+}
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};

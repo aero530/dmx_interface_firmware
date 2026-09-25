@@ -74,13 +74,77 @@ Do: W6300-EVB-Pico2 in the socket (U1), supply on. Nothing on the strips or USB 
 - ✓ Heartbeat: module user LED blinks once per second.
 - [ ] Log shows `DMX interface starting on RP2350`, no `previous reset: WATCHDOG TIMEOUT`, `TCA9555` and `PCA9633` init without error, `TFT: up, 35x11 grid`.
 - [ ] **D2 temperature** after 10 min: warm, not hot (< 40 °C rise) — it carries the full logic + TFT current. (D1 is the TVS and should be cold.)
-- [ ] **VSYS monitor** log line ≈ 4.55–4.7 V (5 V build) and no low-VSYS warning.
+- [ ] **VSYS monitor / brownout margin** — **measured 2026-09-21 on J26 alone, and the margin is thin.**
+
+  | Load | `V_LED` | VSYS | Margin to the 3.6 V brownout |
+  |---|---|---|---|
+  | none | 4.97 V | **4.28 V** | 680 mV |
+  | 2 strips | 4.60 V | **3.90 V** | **300 mV** |
+  | 3 strips | 4.25 V | ~3.55 V (extrapolated) | **at or below** |
+
+  The two clean readings differ by 690 and 700 mV, which is the two series Schottkys (R6-P1 diode,
+  then D2) behaving exactly as expected. An earlier set showing VSYS *above* `V_LED` was taken with
+  the module USB connected: the diode-OR (ARCHITECTURE §7) fed VSYS from the module’s own internal
+  Schottky at ~4.80 V and hid the sag completely. **Always confirm `pwr=` reads `ftdi_vbus=0
+  rpi_vbus=0` before trusting a VSYS number.**
+
+  - **This is the risk ARCHITECTURE §7 item 3 names.** The module regulator is a buck: below ~3.5 V
+    it passes its input straight through and IOVDD follows, so logic and DMX brown out together at
+    VSYS ≈ 3.6 V. Two strips leaves 300 mV. Eight ports at full white is not survivable on this
+    supply as it stands.
+  - **R6-P1 cost ~350 mV of that margin** and this is where it lands. The fix was right - it closes a
+    real hazard - but "VSYS ~4.3 V, far above the module buck’s floor" was judged against an idle
+    rail, not against the rail sagging under LED load, which is the case that matters. Recorded so
+    the trade is visible rather than implied.
+  - **`VSYS_LOW_MV` (4400) now fires at idle.** Do **not** raise or lower it yet: at these voltages
+    the board really is operating near its floor, so the warning is telling the truth and silencing
+    it would hide the problem. Re-set it only once the rail is fixed, and from a measurement.
+
+  **Fix the rail first, in this order — the first two are free:**
+
+  1. **Trim the J26 PSU up.** 4.97 V no-load is *below* the ≥ 5.1 V the design review §87 asks for.
+     Every millivolt here reaches VSYS one-for-one. Trimming to ~5.2 V buys back most of what R6-P1 cost.
+  2. **Check the J26 harness.** 720 mV of droop across three strips on the `V_LED` plane is
+     resistance, not regulation. Review §62 specifies **4 × 18 AWG minimum** for the V_LED and GND
+     groups, and §§57–62 note the harness was never drawn and is unfused. A thin bench pigtail would
+     produce exactly this. **Record where each probe sat** — plane (C17 / F9 input) or after a port
+     PTC (F10–F17) — because only a plane measurement implicates the harness.
+  3. Only if 1 and 2 leave it short: replace the R6-P1 Schottky with an ideal diode (P-FET +
+     controller, ~20 mV instead of ~350 mV). The review already specs an LTC4412 + P-FET for the
+     other path in §90, so the approach and the parts are known.
+
+  **Then re-measure** at idle, 2, 3 and all 8 ports, and check for watchdog resets at 3 ports — the
+  extrapolation puts that case at the brownout threshold, and a reset there would confirm it.
+
 - [ ] TCA9555 (U12) after init: P04 is an **output driven low** — `USB_LED_EN` (U14 pin 3) = 0 V; P05 = 0 and P06 = 0 with nothing on either USB port; `USB_LED_FLT` (U14 pin 4 / R35) = 3.3 V and P07 reads 1.
 
 ## Stage 3 — Display and front panel
 
 - ✓ **Straps first**: JP4 bridged **1-2 (GND)** so U12 answers at 0x20 (A1/A2 are R29/R30 to GND); firmware probes 0x20 only. 2-3 would put it at 0x21 and the panel stays dark.
 - ✓ Backlight (U11 LED0 → J4 pin 8) comes on **after** the menu is drawn (no visible power-on noise). J4 pin 8 averages ≈ 3.3 V × brightness/256 on a meter — **≈ 2.6 V at the default 200**. Reading ≈ 0.7 V instead means the PCA9633 is running with INVRT clear (sink polarity: on-time low) and the backlight is at 22 %; found on the first board 2026-09-15 and fixed in `pca9633.rs` (MODE2 = 0x14).
+- [ ] **Visual refresh (2026-09-25), to look at on the glass.** Built to RGB565-quantized mockups; the
+  panel's own gamma is the one thing the mockups could not model.
+  - The selected row is a dark blue bar (`0x18,0x30,0x50`). Check it is visible at backlight 1, the
+    dimmest usable level; if it is not, the fix is the constant `SELECTED_BG` in `tft_ui.rs`.
+  - Splash: the wordmark centred, the flag's six stripes in order red, orange, yellow, green, blue,
+    violet, version bottom-left, `ETH dhcp...` bottom-right turning to the IP if the link comes up
+    inside the 1.5 s. A button ends it early. The flag's green and violet are the dimmest colours
+    on the panel — confirm they read as green and violet and not as black.
+  - Activity lamp: the disc left of the IP goes blue within a second of frames arriving and grey
+    within a second of them stopping, in **every** input mode — wired DMX on J5, Art-Net, sACN and
+    `USB>DMX` from `tools/enttec.py`. It is set from the router's DMX event, so a mode whose input
+    never posts one would show grey with a live fixture.
+  - Layout page under `Fixtures`: each live port draws as a strip, fixtures alternating blue and
+    green, gaps dark, to scale against the longest port; a 1 px black gap between rows and between
+    fixtures. Selecting a strip row highlights only its label. The LED page shows the universe
+    budget bar under `Universes`.
+  - Footer on every page (`Up Dn move   Sel edit  Esc page`); `Sel open` on a port row under
+    `Fixtures`, `Esc back` inside a table, and the edit wording while editing. Nothing on any page
+    is hidden behind it (Layout, the fullest, has nine rows; System's power note ends on row 7).
+  - Idle screen after 30 s without a button: digits match `DMX Address`, one bar per port to the
+    same scale as the Layout strips, the lamp follows the input, the IP and power note match the
+    title bar. Any button returns to the menu on the same row, redrawn cleanly (no remnants of the
+    digits).
 - ✓ **Backlight, menu and UI confirmed working** (2026-09-15, first board). Getting
   there took a day; the fault was mipidsi's `SWRESET`, written up below.
 - ✓ **If a board comes up blank with the backlight on** — work down, stop at the
@@ -88,7 +152,7 @@ Do: W6300-EVB-Pico2 in the socket (U1), supply on. Nothing on the strips or USB 
   already been found once, and `tft_ui::NoReset` is the guard against it coming back.
   1. Is the box resetting? Module LED must blink steadily at 1 Hz and the USB CDC ports must not re-enumerate; a ~4 s cycle is a panic → watchdog loop (with the probe, the log shows it). A build from before 2026-09-08 has a 32 KB heap that the display's two cell buffers alone overrun — rebuild.
   2. **No probe needed**: on the USB console, `info` prints `diag=` with every display step reached — `expander_ok tft_res_released tft_init_ok tft_splash_done backlight_ok terminal_ok first_frame_drawn` is a complete pass; a capitalised token (`TFT_INIT_FAIL`, `TERMINAL_FAIL`, `DRAW_ERROR`, `EXPANDER_FAIL`) names the failing step. Note the SPI bus is write-only: mipidsi's `init` **cannot** detect an absent or unresponsive panel, so `tft_init_ok` does not prove the panel heard anything — the splash does.
-  2b. **Colour splash**: at boot the firmware fills the panel red, green, blue, then black (150 ms each) before the menu. No splash = SPI data is not reaching the panel or the controller is not what the firmware expects (steps 3–6). Splash in the wrong colours (cyan / magenta / yellow) = `ColorInversion` is wrong; swapped red/blue = colour order. Splash correct but no menu = the Ratatui/mousefood draw path (check `first_frame_drawn` vs `DRAW_ERROR` in `diag=`).
+  2b. **Boot splash** (was a red/green/blue fill until 2026-09-25; now the `DMX INTERFACE` wordmark over a six-stripe flag, 1.5 s): the same three answers come from it — no wordmark, wrong colours in the flag, or a wordmark but no menu. No splash = SPI data is not reaching the panel or the controller is not what the firmware expects (steps 3–6). Splash in the wrong colours (cyan / magenta / yellow) = `ColorInversion` is wrong; swapped red/blue = colour order. Splash correct but no menu = the Ratatui/mousefood draw path (check `first_frame_drawn` vs `DRAW_ERROR` in `diag=`).
   3. J4 pin 7 (`DISPLAY.CS`, U12 P11) = **0 V** after boot and J4 pin 5 (`DISPLAY.RES`, P10) = 3.3 V. CS at 3.3 V means the expander is not driving it (init failed, or the TCA9555's internal pull-up is all that is there) and the panel ignores every byte.
   4. J4 pin 2 = 3.3 V at the panel; pin 1 GND. Header order at J4 is GND · 3V3 · SCK · MOSI · RES · DC · CS · BL — match it to the module's own silk (`GND VCC SCL SDA RES DC CS BLK` on the common 1.47" ST7789 boards); the order was provisional at design time.
   5. Scope J4 pins 3/4/6 during the first second: an SPI burst at `TFT_SPI_HZ` (5 MHz) with DC toggling. Clock rate has never been the fault here — do not spend time sweeping it. `DISPLAY.SCK` is a capacitive net and rounds off above ~10 MHz; that is why the constant sits at 5 MHz, and it is a known limit rather than a fault (ARCHITECTURE §11 has the pad-drive fix if it ever matters).
@@ -425,34 +489,89 @@ A rig with different strip lengths or a different bound count only changes `--co
 
 ## Stage 6 — Wired DMX
 
-- [ ] Receive: console into **J5** (male XLR, "Input"), DMX mode → `dmx 1 16` on the console tracks the faders; log `DMX: receiving`. Unplug → `DMX: no data` within 1 s; replug → `signal restored`.
+- ✓ Receive: console into **J5** (male XLR, "Input"), DMX mode (2026-09-17). Values arrive — confirmed from the bytes with `tools/enttec.py --monitor`, not just from LEDs — and pulling the cable logs `DMX: no data` within 1 s. Replug → `signal restored` is the same `quiet` flag flipping back (`dmx.rs:119`) and follows from receiving again.
+  - **Two windows, and they show different things.** `--monitor` (first CDC port) shows *values*, and only when they change. `DMX: receiving` / `DMX: no data` / `DMX: signal restored` are **log lines** (`dmx.rs`, 1 s silence timeout) and appear on the **log port** — the third CDC, with `pico2-usb.uf2` — or over RTT with a probe. They are not Enttec messages and will never show in the tool.
+  - **`--monitor` correctly goes silent on unplug.** The firmware stops writing `DMX_BUFFER` rather than zeroing it, so the last look holds and there is no change to forward. That is deliberate — a dropped cable must not black out a show mid-scene — but it does mean loss of signal is invisible to a host watching the widget, and only the log reports it.
 - [ ] Alternate start codes (RDM traffic from the console) do not disturb channel values.
-- [ ] Scope GP9 (U1 pin 12, → R9 → U3) and GP10 (U1 pin 14, → R12 → Q1) in `USB>DMX`, driven from the **module’s native USB** widget port — U2 is not fitted, see Stage 8: GP10 **high** while transmitting (Q1 on, U7 LED off), low in every other mode; DMX out on **J15** (female XLR, "Output") drives a fixture; BREAK 176 µs, MAB 16 µs, ~43 packets/s. `ArtNet>DMX` exercises the same transmit path with no USB host at all (`tools/dmxsend.py`), so it is the simpler first check and isolates the driver from the widget.
-- [ ] `ArtNet>DMX`: the configured Art-Net universe appears on J15.
-- [ ] Undriven state: with the module removed, U4's driver is **disabled** (fail-safe receive: R1 biases the U7 LED on, DE/RE pulled low through the opto).
-- [ ] Isolation: `3V3ISO` to `GND` still open with the bus connected; no ground current through the XLR shield (CHGND → R4 → GND only).
+- ✓ **Driver enable (GP10)** (2026-09-17): **high** in `ArtNet>DMX` and `USB>DMX`, low in every other mode — exactly the two modes `InputMode::is_dmx_output()` names. That is the check that matters most on a shared bus: a stuck-high enable makes the board fight a console.
+- ✓ **DMX line timing at the source** (2026-09-17): GP9 (U1 pin 12, → R9 → U3) in `ArtNet>DMX` driven by `tools/dmxsend.py` measures **BREAK 177 µs, MAB 16 µs** — exactly what the PIO program computes at 1 µs/cycle (`set x, 21 side 0` = 1, then 22 × 8 = 176; MAB is `nop` 8 + `pull` 8). Deterministic, so any spread in a measurement means something else is on the wire.
+  - **Unplug the console from J5 first.** With the board in plain `DMX` mode, GP10 is low and the transceiver is not driving J15 at all, so a scope on the bus reads the *console* — BREAK 111–180 µs and MAB 8–12 µs, varying frame to frame, which is what a real console looks like and nothing like a PIO program. That cost a measurement on 2026-09-17.
+  - MAB can only ever be **longer** than 16 µs, never shorter: `pull` stalls with the line high if the DMA has not filled the FIFO.
+- ✓ **DMX line timing on J15 itself** (2026-09-17): packets reach J15 through the isolator and transceiver (U3/U4) and a **fixture follows**, in both `ArtNet>DMX` and `USB>DMX`. Measured **43.5–43.8 Hz**.
+  - That rate is the expected one, and the small spread has a cause rather than being noise. A frame is `BREAK 177 + MAB 16 + 513 slots × 44 µs` = 22.765 ms → **43.93 Hz** if the transmitter never paused. `PioDmxTx::write` then waits for the state machine to drain by **polling every 100 µs** (`Timer::after_micros(100)`), plus 10 µs for the last stop bits, so each frame lands 10–110 µs late: 43.7 Hz ± 0.2. Measurement and arithmetic agree.
+  - A slot is 44 µs because it is 11 bits at 4 µs: `pull side 1 [7]` = 2 stop bits, `set x, 7 side 0 [3]` = the start bit, then 8 × 4 cycles of `bitloop`.
+  - Do **not** chase the last 0.2 Hz by shortening the poll interval. DMX has no minimum refresh rate that this is near, and the poll is what guarantees the frame is fully on the wire before the next BREAK.
+- ✓ `ArtNet>DMX`: the configured Art-Net universe appears on J15 (2026-09-17) — the same data reaches J15 and the LED strip, which is what `is_dmx_output()` promises: the wired output is a *copy* of what the strips render, not an alternative to it.
+- ✓ Undriven state: with the module removed, U4's driver is **disabled** (fail-safe receive: R1 biases the U7 LED on, DE/RE pulled low through the opto).
+- ✓ Isolation: `3V3ISO` to `GND` still open with the bus connected (2026-09-17); no ground current through the XLR shield (CHGND → R4 → GND only). This is the check that matters on a rig where the console and the board are on different mains circuits.
 - [ ] **Short-frame consoles**: with a console configured for fewer than 512 slots (e.g. 24), press buttons on the TFT while a fixture above the console's slot count is patched. Any flicker there is the known short-frame/redraw interaction (ARCHITECTURE §11), not a wiring fault; a 512-slot console must show none.
 
 ## Stage 7 — LED outputs
 
-- [ ] Boot: all eight strings dark (blank frame), no flash of stale colour at power-up.
-- [ ] Scope one data line (J1 pin 1, after R21): 800 kHz bit rate, 1.25 µs/bit, **≥ 150 µs** idle between frames; frame time ≈ 30 µs × LED count (18 ms at 600).
-- [ ] RGB (WS2812/WS2815 strip): DMX channels 1-3 = R,G,B of LED 1 — **colour order correct** (GRB on the wire).
-- [ ] **RGBW (SK6812 strip)**: `Color Mode = RGBW`, channels 1-4 → R,G,B,W of LED 1; white channel lights the white die only; a WS2812 strip in RGBW mode shows the expected garbage (proves the mode switch reaches the wire).
-- [ ] Mixed length: `LEDs Port 1 = 10` — the strip beyond LED 10 keeps its last latched value only until the next blank; frame rate rises (shorter DMA).
-- [ ] Group size 3 on a port: three physical LEDs per DMX pixel. Mirror mode: all ports identical.
+- ✓ Boot: all eight strings dark (blank frame), no flash of stale colour at power-up. Confirmed 2026-09-17.
+- ✓ Scope one data line (J1 pin 1, after R21): 800 kHz bit rate, 1.25 µs/bit, **≥ 150 µs** idle between frames; frame time ≈ 30 µs × LED count (18 ms at 600). Confirmed 2026-09-17.
+- ✓ RGB (WS2812/WS2815 strip): DMX channels 1-3 = R,G,B of LED 1 — **colour order correct** (GRB on the wire). Confirmed 2026-09-17.
+- [ ] **BLOCKED — no SK6812 strip on the bench (2026-09-17).** **RGBW (SK6812 strip)**: `Color Mode = RGBW`, channels 1-4 → R,G,B,W of LED 1; white channel lights the white die only; a WS2812 strip in RGBW mode shows the expected garbage (proves the mode switch reaches the wire).
+- ✓ Mixed length: `LEDs Port 1 = 10` — the strip beyond LED 10 keeps its last latched value only until the next blank; frame rate rises (shorter DMA). Confirmed 2026-09-17 on port 1.
+- ✓ Group size 3 on a port: three physical LEDs per DMX pixel. Confirmed 2026-09-17 on port 1.
+- [ ] **Fixtures: runs of different sizes on one strip.** `Grouping = Fixtures`, then Layout → select a port → its table. Set `F010`, `F005`, `G005`, `F030` on a 60-LED port: DMX items 1–3 drive LEDs 1–10, 11–15 and 21–50, and the panel shows those spans in blue beside each row. Walk them with `tools/enttec.py --map` to confirm which channels own which pixels.
+  - **The gap check, done the way that can fail**: light the whole strip first (`--pattern solid`), *then* apply the layout. LEDs 16–20 and 51–60 must go dark **immediately**. Applying a layout to an already-dark strip proves nothing — WS2812s latch, so the failure mode is a gap that keeps the previous colour.
+  - Lower `LEDs Port n` below the fixture total afterwards: the entries must still be editable *down*. If they freeze, the length bound is using "what is left" rather than "what is left plus this entry's own".
+  - Repeat with `Mirror Ports = On`: every port shows the same items, each through its own fixture list.
+  - Console equivalent: `set fixture_1_1 F010` …, then `get` to read them back. A value that does not survive `get` → `set` means the rendered form has a space in it.
+- ✓ **Mirror mode: every port shows the same addressable items** (reworked and confirmed on hardware
+  2026-09-17, including the greyed-out menu values and the computed number beside them). Port 1's
+  LED count and group size fix how many items there are; every other port spreads that many items
+  across its own strip, so `Group Size Port 2..8` is **computed** while Mirror is selected. 24 LEDs
+  grouped by 4 is six groups, so a 12-LED port mirrors it grouped by 2 and a 48-LED port grouped
+  by 8 — the same six items, each stretched to the strip it is on.
+  - The size **scales from port 1** (`leds_n × size_1 / leds_1`), it is not the length divided by
+    the item count. The two agree whenever port 1’s group size divides its LED count and differ
+    otherwise — see the 2026-09-17 bench finding at the bottom of this item.
+  - **On the panel** those rows show two numbers: the stored value dimmed grey, and the computed
+    one in blue a column to its right. The stored value stays editable on purpose — it is what
+    `Individual` mode goes back to, so hiding it would mean leaving Mirror just to set a port up.
+  - **Rounding is down**: 50 LEDs across 6 groups is 8.33, so the port groups by 8, covers 48, and
+    the last two LEDs are driven black rather than making one group visibly longer.
+  - A port with fewer LEDs than there are groups shows the leading groups, one LED each.
+  - Check: P1 24/4 and P2 12, P3 48, P4 50 — all four must show six identical items, P4 with two
+    dark LEDs on the end, and the LED page must read `004` grey + `002`/`008`/`008` blue on those
+    three rows. Switch to `Individual` and the blue column disappears.
+  - Then the original case: P1 10 LEDs grouped by 3 with P2 at 64 — **three** items on both
+    (`floor(10/3)`), P2 grouped by 19 and lighting 57 of its 64. Port 1 leaves its 10th LED dark,
+    so its mirror leaves the same tenth of its own strip dark; that is the mode working, not a
+    rounding bug.
+  - **Two identical ports must group identically** — the 2026-09-17 bench report: P1 and P2 both
+    64 LEDs, P1 grouped by 3, P2 computed **2**. Two causes, both now fixed and pinned by an
+    exhaustive sweep in `host_tests/tests/mirror.rs`:
+    1. The item count used `ceil` (`virtual_leds_per_port`), giving 22 items for 64/3. The 22nd
+       holds one LED on port 1 but a full group elsewhere, so `64 / 22 = 2` on port 2 — 44 LEDs
+       lit beside port 1’s 64. The count now rounds **down**: 21 items.
+    2. Dividing the length by the item count is wrong even with the count fixed. 10 LEDs grouped
+       by 4 is two items, so a second 10-LED port got `10 / 2 = 5` against port 1’s 4. The size
+       now scales from port 1, which returns port 1’s own size for any port of its length by
+       construction.
+  - Quick check for both: set P1 and P2 to the same LED count and a group size that does **not**
+    divide it (64 and 3). The two strips must be indistinguishable, and the panel must show the
+    same number in blue on the P2 row as P1 has in white.
+  - Found by the case that prompted it: P1 10/3 with P2 64/2 lit LEDs 1–12 on P2 against 1–10 on
+    P1, because `ceil(10/3)` paints four groups of three and only P1's length truncated it. The
+    arithmetic is pinned by `host_tests/tests/mirror.rs`.
+
 - [ ] 600 LEDs on all 8 ports at 44 Hz for 10 min: no dropped frames, U10 cool, `5V_LVL_SHIFT` (after L3, at C41) = 5.0 V.
 - [ ] Per-port protection: short a strip's V+ to GND through a 5 A load → that port's PTC (F10–F17) trips, and on a power-board-fed strip the blade insert (F3/F4/F7/F8/F9/F12/F13/F14) opens, with no effect on other ports; the PTC recovers when cleared.
 
 ### LED Power = USB brick (5 V build only)
 
-- [ ] Menu **System → LED Power** offers `External` / `USB brick`; console `set led_power usb` and `get` agree with the display.
-- [ ] With `External`: `USB_LED_EN` (U14 pin 3) = 0 V whatever is plugged into J2. This is the safe default and a PC must never be loaded.
-- [ ] With `USB brick` **and no brick attached**: EN stays low (the firmware also requires VBUS present on P05, via R39/R40).
-- [ ] With `USB brick` and a 5 V brick on J2: EN goes high, `V_LED` ≈ 4.9 V through U14 → F2, title row shows `PWR usb`.
-- [ ] **Budget**: drive all eight ports to full white. The frame is scaled so the draw stays near 1.3 A — measure it in the brick lead; U14 must not latch. Note the budget only covers ~21 full-white RGB pixels unscaled, so heavy content will visibly dim. That is the intended behaviour.
-- [ ] **Fault latch**: short an output briefly (current-limited bench supply). `FAULT` (U14 pin 4) pulls low, firmware logs `USB LED power: FAULT`, EN drops, and it retries ~2 s later with `PWR flt` on the title row meanwhile. After three failures it logs `staying off until LED Power is changed`, and toggling the setting clears it.
-- [ ] Unplug the brick while enabled: EN drops (logged as `brick removed`, not as a fault), no glitch on `V_SYS`, logic keeps running from D4/F1 until the PSU path takes over.
+- ✓ Menu **System → LED Power** offers `External` / `USB brick`; console `set led_power usb` and `get` agree with the display. Confirmed 2026-09-21.
+- ✓ With `External`, **U14 is off** (2026-09-18): `V_LED` = **4.66 V** with a 5 V source on J2 and nothing else connected — one B360A drop below VBUS, so the rail is being fed through D4 and *not* through the switch. `USB_LED_EN` (U14 pin 3) = 0 V.
+  - **But the strips still light, and the rail is still live.** See "The `External` setting does not isolate the LED rail on a 5 V build" under Known issues. The firmware is behaving correctly here; the isolation the item assumed does not exist on this build variant. The original wording checked only EN, so it would have passed with the rail live — measure `V_LED`, not just EN.
+- ✓ With `USB brick` **and no brick attached**: EN stays low (the firmware also requires VBUS present on P05, via R39/R40). Confirmed 2026-09-21.
+- ✓ With `USB brick` and a 5 V brick on J2 (2026-09-18): `V_LED` = **5.00 V**, i.e. through U14's FET rather than a diode — the 0.34 V step from `External` is the whole proof that the two paths are different silicon. EN goes high through U14 → F2.
+  - [ ] Still to check on this item: the title row shows `PWR usb`.
+- ✓ **Budget**: drive all eight ports to full white. The frame is scaled so the draw stays near 1.3 A — measure it in the brick lead; U14 must not latch. The title row must read **`PWR usb NN%`** while it is scaling (the percentage appears only below full output, so `PWR usb` alone means nothing is being held back). That indicator was added 2026-09-18: without it, dim strips look like a fault rather than the budget working, which is the confusion the `External`/`USB brick` brightness difference caused on the bench. Note the budget only covers ~21 full-white RGB pixels unscaled, so heavy content will visibly dim. That is the intended behaviour. Confirmed 2026-09-21.
+- ✓ **Fault latch**: short an output briefly (current-limited bench supply). `FAULT` (U14 pin 4) pulls low, firmware logs `USB LED power: FAULT`, EN drops, and it retries ~2 s later with `PWR flt` on the title row meanwhile. After three failures it logs `staying off until LED Power is changed`, and toggling the setting clears it. Confirmed 2026-09-21.
+- ✓ Unplug the brick while enabled: EN drops (logged as `brick removed`, not as a fault), no glitch on `V_SYS`, logic keeps running from D4/F1 until the PSU path takes over. Confirmed 2026-09-21.
 
 ## Stage 8 — USB
 
@@ -502,7 +621,7 @@ the CDC port had, at the cost of our own console.
 
 - [ ] **Identity**: `info` on the console shows a MAC of `02:44:4D:xx:xx:xx` when none is programmed, and the USB serial (Device Manager / `lsusb -v`) is 16 hex digits — **different on every unit**. Two units on one PC must enumerate as two COM ports.
 - [ ] **FTDI straps** — *set now, verify when U2 arrives.* JP1 and JP2 both bridged **1-2** = straight (U2 TXD ← `FTDI.TX` net → GP13; U2 RXD ← `FTDI.RX` net ← GP28). 2-3 on both swaps TX/RX if a board is wired the other way round — never mix.
-- [ ] Module USB-C on a PC: two (three with the `usb` feature) CDC ports enumerate; port order = Enttec widget, console (, logger). `dmx_console` connects on the second. With U2 unfitted this is the board’s only USB data port.
+- ✓ Module USB-C on a PC: two (three with the `usb` feature) CDC ports enumerate; port order = Enttec widget, console (, logger). Confirmed 2026-09-17 with `pico2-usb.uf2` in `DMX` mode — widget answers `--params` on the first, `info` answers on the second, the log streams on the third. With U2 unfitted this is the board’s only USB data port.
 - [ ] **Console fixture patch — the thing that will look like a firmware bug and is not.** The board
   maps **raw DMX channels** to LED components, three per pixel, with no concept of a fixture. A console
   patched with a fixture whose definition is not exactly 3 channels of R, G, B shifts every pixel after
@@ -513,9 +632,11 @@ the CDC port had, at the cost of our own console.
   console's own DMX monitor to confirm fader N moves channel N before suspecting the board.
   `tools/enttec.py --map 12` is the reference: it drives known channels with no console in the loop.
 - ✓ **Automatic re-enumeration** (2026-09-17). Change the mode into `USB>DMX` and out again. Each crossing reboots the board after ~750 ms and it comes back as the other device; changes that do not cross the boundary (`DMX` ↔ `ArtNet`, say) must **not** reboot. After two crossings in a row, `info` must still show `boot=Some(Success)` and Ethernet must still come up — that is the lockout guard staying clear.
-- [ ] **Widget in a non-`USB>DMX` mode (CDC).** The widget interface enumerates and answers `GET_PARAMS` / `GET_SERIAL`, but `OUTPUT_DMX` is refused by design (`enttec_widget.rs`) so a PC left plugged in cannot overwrite live wired-DMX or Art-Net data. Console and logger are on the second and third ports as before.
+- ✓ **Widget in a non-`USB>DMX` mode (CDC)** (2026-09-17, `DMX` mode). `tools/enttec.py --port COMn --params` round-trips on the **first** CDC port: `7e0305002c01100228e7` → firmware 1.44, break 16, MAB 2, refresh 40 Hz — the same reply the FT232R identity gives, so the framing is identity-independent. `OUTPUT_DMX` is refused by design (`enttec_widget.rs:68`) so a PC left plugged in cannot overwrite live wired-DMX or Art-Net data; `tools/enttec.py` now warns before those commands instead of appearing dead.
+  - Also proves the **other direction**, which no earlier test had: `--monitor` decoded the unprompted label-5 frames the board sends when the universe it receives changes, e.g. `start 0x00 | 0 0 255 ...`. That is `payload[1]` = channel 1, so a lit channel 3 is pixel 1 blue — the same convention the QLC+ session showed, confirmed from the bytes rather than inferred from the LEDs.
+  - And it clears the risk the `usb_toggle` wrapper introduced: that wrapper sits under **all three** CDC functions, and the widget and console both work with it in place.
 - ✓ **`USB>DMX` mode: the board enumerates as an FT232R** (2026-09-17). Windows binds the FTDI driver and the VCP layer gives it a COM port; `tools/enttec.py --port COMn --params` round-trips `GET_PARAMS` (firmware 1.44, break 16, MAB 2, refresh 40 Hz), which exercises the bulk IN path including the two status bytes, and `--map 12` gives red/green/blue per pixel in the correct order. **The widget, the FTDI transport and the channel mapping are proven** — anything anomalous from a lighting console is that console's patch, not the board. `tools/enttec.py --pattern chase` is the known-good sender to compare against.
-- [ ] **`USB>DMX` output on J15.** The widget and the LED path are proven above; what is not is the wired output in this mode. Covered by the GP9/GP10 scope check in Stage 6 — do it there, with a fixture on J15. If Windows ever shows a driver error instead of an FTDI device, FTDI's driver is missing: install it from FTDI rather than from Windows Update's generic list.
+- ✓ **`USB>DMX` output on J15** (2026-09-17): a fixture on J15 follows host DMX in this mode, so the FT232R identity, the widget, the router and the wired transmitter work as one path. Recorded with the timing in Stage 6. If Windows ever shows a driver error instead of an FTDI device, FTDI's driver is missing: install it from FTDI rather than from Windows Update's generic list.
   - Faders in QLC+ drive the LEDs, and `USB>DMX` output appears on **J15**.
   - If QLC+ enumerates it but reads fail, the likely culprit is the EEPROM read request (`0x90`), which `ftdi.rs` answers with zeros — see the note there.
   - If Windows shows a driver error rather than an FTDI device, FTDI’s driver is missing: install it from FTDI rather than from Windows Update’s generic list.
@@ -524,10 +645,17 @@ the CDC port had, at the cost of our own console.
 - [ ] **BLOCKED — U2 not fitted.** **FTDI port (J2)**: after programming U2 per [ft232rnl-eeprom.md](ft232rnl-eeprom.md), Windows shows `ENTTEC` / `DMX USB PRO`; QLC+ lists a DMX USB Pro; log `FTDI widget: locked at 250000 baud`; faders drive the LEDs in `USB>DMX` mode.
 - [ ] **BLOCKED — U2 not fitted**, and vacuous without it: the test is of U2’s `RESET#` gate. With the box **unpowered**, plugging J2 into a PC does nothing (U2 `RESET#` follows VBUS through R24/R25 and U2 is self-powered from 3V3: no enumeration, no back-drive). With the box powered, it enumerates.
 - [ ] **BLOCKED — U2 not fitted**: baud hunting detects the rate on UART0, and nothing drives UART0. Baud hunting: open the port at 57600 with a Python Enttec script → `locked at 57600 baud`. (Over the module’s CDC port baud is meaningless — there is no UART — so this check has no CDC equivalent.)
-- [ ] **Module USB only** (PSU off, nothing on J2): `V_SYS` ≈ 4.4–4.7 V, `V_LED` ≈ 4.3–4.6 V through D3/F18, P06 = 1 (R41/R42), P05 = 0, strips stay dark (F18 is 0.5 A — firmware must not drive them). Fail → strips lit or F18 cycling = the brightness budget / power-mode logic is not honouring the source.
-- [ ] **Brick on J2 only** (5 V, ≥ 2 A, no PD, 3 A-rated cable), `LED Power` still `External`: `USB_LED_EN` = 0 V (R38), `V_LED` = 0 V (U14 off — a disabled USB power switch passes nothing), `5V_LOGIC` ≈ 4.65 V via F1/D4, P05 = 1 (R39/R40), FAULT high, the unit boots and the display works. Fail → EN high with the setting off = R38 missing / P04 driven high; `V_LED` at ≈ 4.3 V with EN low = something with a body diode was fitted in U14's place.
-- [ ] Set `LED Power = USB brick`: `USB_LED_EN` = 3.3 V (P04 driven high), `V_LED` ramps up (U14 soft start) to ≈ 4.9 V, drop across U14 ≤ 150 mV at 1.3 A full-white on two short strips, FAULT stays high, U14 under 40 °C rise; F2 never trips. Push the load to ≈ 1.6 A: U14 latches off within 10 ms and FAULT goes low (P07 = 0); firmware backs off and re-arms as in stage 7. Then plug the PSU in (trimmed ≥ 5.2 V) while the brick runs: U14 opens once `V_LED` is ≈ 135 mV above the brick (FAULT low, `V_LED` follows the PSU, no `V_SYS` glitch on the scope); unplug the brick: nothing changes.
-- [ ] **PC on J2** with the PSU off — **the power half is testable now, the enumeration half is blocked** (U2 not fitted, so nothing enumerates): logic runs from D4 (≈ 0.35 A from the port), `V_LED` = 0 V, strips dark. Note: P05 is 1 for a PC and a brick alike — the board cannot tell them apart, so the `USB brick` setting is the user’s declaration; the manual must say a PC port is not a brick.
+- ✓ **Module USB only** (PSU off, nothing on J2) — confirmed 2026-09-21: `V_LED` = **4.49 V** through D3/F18 (in the 4.3–4.6 V band), `rpi_vbus=1` on the new `info` → `pwr=` line, strips lit in both `LED Power` modes and the amber note shown. Everything here is correct behaviour — see the sub-points below for why lit strips are the expected result on this feed.- [ ] 
+  - **The strips WILL be lit, in either `LED Power` mode. That is correct** — corrected 2026-09-18, this item previously said "strips stay dark … firmware must not drive them" and would have logged a pass as a failure. `D3 → F18 → V_LED` is unswitched and `LED Power` does not reach it; the R6-P1 Schottky is in the logic branch and deliberately does not touch this path. Firmware cannot reliably detect the case either — with no J26 present-detect it cannot tell "module USB is the only source" from "J26 is up and someone plugged in a debug cable", and dimming the second case would be worse. See the Known-issues entry for the arithmetic.
+  - What to check instead: the panel shows the amber note **`Module USB also powers LEDs / This setting cannot stop it / 0.5 A fuse - may flicker`** under `LED Power` while VBUS is present on that port.
+  - **F18 is 0.5 A**, so at high brightness expect it to hold briefly then cycle. Strips that **pulse** are F18 recovering, not a firmware fault; strips that **dim smoothly** are the budget, and the budget only applies in `USB brick` mode. Both are expected behaviour on this feed.
+- ✓ **Brick on J2 only** (5 V, ≥ 2 A, no PD, 3 A-rated cable), `LED Power` still `External`: `USB_LED_EN` = 0 V (R38), `V_LED` = 0 V (U14 off — a disabled USB power switch passes nothing), `5V_LOGIC` ≈ 4.65 V via F1/D4, P05 = 1 (R39/R40), FAULT high, the unit boots and the display works. Fail → EN high with the setting off = R38 missing / P04 driven high. **`V_LED` at ≈ 4.66 V with EN low is R6-P1** — the `5V_LOGIC → L2 → F9` back-feed, fixed by the series Schottky between F9 and `V_LOGIC_IN`; check that diode is fitted and the right way round before suspecting U14. (The earlier wording here blamed "something with a body diode in U14's place", which is what sent the first investigation down the wrong path.) Verified dark on a reworked board 2026-09-18 — this item is now measuring the numbers behind that. Confirmed 2026-09-21.
+- ✓ Set `LED Power = USB brick`: `USB_LED_EN` = 3.3 V (P04 driven high), `V_LED` ramps up (U14 soft start) to ≈ 4.9 V, drop across U14 ≤ 150 mV at 1.3 A full-white on two short strips, FAULT stays high, U14 under 40 °C rise; F2 never trips. Push the load to ≈ 1.6 A: U14 latches off within 10 ms and FAULT goes low (P07 = 0); firmware backs off and re-arms as in stage 7. Then plug the PSU in (trimmed ≥ 5.2 V) while the brick runs: U14 opens once `V_LED` is ≈ 135 mV above the brick (FAULT low, `V_LED` follows the PSU, no `V_SYS` glitch on the scope); unplug the brick: nothing changes. Confirmed 2026-09-21.
+- ✓ **PC on J2** with the PSU off (2026-09-21): **the board does not boot at all**, in either `LED Power` mode. Safe, and not what this item predicted — it said "logic runs from D4 (≈ 0.35 A from the port)", which assumed the port would supply that.
+  - **Why.** An unconfigured USB device may draw **one unit load (100 mA)** until it enumerates and its configuration is selected. U2 is not fitted, so nothing on J2 ever enumerates and the host never grants more. The logic wants ~0.35–0.7 A, so the port limits or the rail collapses. A brick has no such gate, which is why the identical connector works from one and not the other.
+  - **This confirms review §77 on hardware**: the FT232RNL is configured self-powered and declares ≤ 100 mA, so **fitting U2 will not fix it** — the descriptor still will not ask for the current the board draws through D4. Expect the same behaviour on a populated board.
+  - **Consequence for the product**: J2 is a *data* port. A unit must be powered from J26 or a brick; a PC alone will not run it. The manual has to say so, and the failure is at least quiet and self-limiting rather than a brownout loop. Worth re-checking for oscillation once U2 is fitted.
+  - Note: P05 is 1 for a PC and a brick alike — the board cannot tell them apart, so the `USB brick` setting is the user’s declaration; the manual must say a PC port is not a brick.
 
 ### Carried over from the design record
 
@@ -537,6 +665,241 @@ the CDC port had, at the cost of our own console.
 - [ ] **W6300 diagnostics**: version register reads correctly, and the three failure states (chip dead / link down / no DHCP) are distinguishable in the log — the only diagnostic path left for the undiagnosed Rev 1 Ethernet failure.
 - [ ] **Buttons**: chord detection (two at once); a quick tap registers at the 20 ms poll; no phantom presses while the EEPROM task is writing on the shared bus.
 - [ ] **Power transients**: scope `V_SYS` (J9 is a GND/3V3 probe point; V_SYS at C38/C45) and `3V3` through power-on, power-off and a full-brightness LED step, with and without USB attached. This is the behaviour that may have been killing Nucleos, so it gets measured rather than assumed.
+
+## Known issues found on the bench
+
+### USB CDC dropped the first connection every time (2026-09-17, fixed)
+
+Symptom: with `pico2-usb.uf2`, opening the **logging** COM port dropped
+immediately; the second attempt held. The board never reset — which is what
+ruled out the watchdog and the identity watcher and pointed at USB itself.
+
+Cause, two parts:
+
+1. **`embassy-rp` 0.10 does not reset the endpoint data toggle on
+   `ClearFeature(ENDPOINT_HALT)`**, which USB 2.0 §9.4.5 requires. Its
+   `endpoint_set_stalled` (`usb.rs:431`) clears the `STALL` bit and stops;
+   `endpoint_set_enabled` twelve lines below does reset the PID, so it is an
+   omission on one path. Windows’ `usbser.sys` resets the bulk pipes when an
+   application opens a COM port, so after every open the host is on `DATA0` and
+   the device is wherever it left off. Mismatched → the host discards the first
+   IN packet → `usbser` reports a failure → the port drops. That transfer
+   realigns them, hence “second time works”.
+2. **`embassy-usb-logger` starts writing at SET_CONFIGURATION, not at DTR.** Its
+   `wait_connection()` means *endpoint enabled*. So the boot log went into the
+   IN endpoint within milliseconds of enumeration, advancing the device’s toggle
+   long before anyone opened the port — and was thrown away unread. Only the
+   logging interface did this, which is why the Enttec and console ports never
+   showed the fault: they stay silent until spoken to, so their toggles were
+   still at the enumeration value and agreed with the host by luck.
+
+Fixes, both in place:
+
+- `pico2/src/usb_toggle.rs` — a `Driver`/`Bus` wrapper that delegates everything
+  and adds the missing toggle reset. Covers every endpoint, including
+  close-then-reopen, which the logger change alone does not.
+- `pico2/src/usb_log.rs` — replaces `embassy-usb-logger`. The sink is installed
+  in `main` so the boot log is captured, and the drain waits for **DTR** so
+  nothing reaches the endpoint before a host opens the port. As a bonus the boot
+  log now survives to be read instead of being spent on a closed port.
+
+### The USB logger carried almost nothing (2026-09-17, fixed)
+
+Found immediately after the above: the logging port opened first time, and
+printed nothing. Not a fault in the transport - there was simply nothing to
+send. The `usb` feature only swapped the logging macros in **8** of 18 files, so
+53 statements reached USB and 82 stayed on `defmt`/RTT, including every one that
+fires during boot (`main`, `w6300`, `eeprom`, `tft_ui`, `identity`,
+`supervisor`). On an idle board in `DMX` mode, the eight shimmed files have
+nothing to say, so the terminal was correctly empty.
+
+Every file now picks its macros through `cfg_if`, so the two builds carry the
+same 135 statements to different places. Cost of the conversion was eight real
+incompatibilities: five `{=u8}` type hints (defmt-only syntax) and three
+`{:02x}` prints of a `[u8; 6]` MAC, which `defmt` renders element by element and
+`core::fmt` cannot - those now go through `identity::mac_text`.
+
+**Trade-off worth knowing:** in the `usb` build the RTT log is now empty, because
+everything went to USB. Panics still reach RTT through `panic-probe`. Use the
+default build when you have a probe.
+
+### The `External` setting did not isolate the LED rail on a 5 V build (2026-09-18, **fixed and verified**)
+
+**Verified on a reworked board, 2026-09-18.** With the Schottky fitted:
+
+| Powered from | `External` | `USB brick` |
+|---|---|---|
+| **J2 only** | **strips dark** ✓ | strips lit |
+| Module USB only | strips lit | strips lit |
+| Both | strips lit, brighter | strips lit, dimmer |
+
+**The J2-only row is the fix.** Before the diode, `External` with a brick on J2 lit the
+strips off the D4 back-feed; it now leaves them dark while the logic still boots, which
+is exactly what the menu promises.
+
+The other two rows are the **D3 → F18 → `V_LED`** module-USB feed, which the diode does
+not touch and was never meant to — it sits in the logic branch, not in D3's path. That
+feed is unswitched and ignores `LED Power` entirely, which is why the strips light in
+both modes, and the brightness difference in the "both" row is the budget applying in one
+mode and not the other (see the bullet on that below). Since that port is **exposed on a
+finished unit** rather than being bench-only as originally assumed, the panel now says so:
+`Module USB also powers LEDs / This setting cannot stop it / 0.5 A fuse - may flicker` appears in amber under
+`LED Power` while the module port has VBUS. Added 2026-09-18 — the setting cannot control
+that path, so the honest fix is to explain it rather than rename the control.
+
+---
+
+Original finding follows.
+
+
+**Hardware, not firmware.** With a 5 V source on J2 and nothing else connected, the
+board boots *and the strips light* while `LED Power` is set to `External`. Booting is
+intended; the strips are not.
+
+**Measured**, which is what makes this certain rather than a theory:
+
+| `LED Power` | `V_LED` | Path |
+|---|---|---|
+| `External` | **4.66 V** | one B360A drop below VBUS — a diode |
+| `USB brick` | **5.00 V** | U14's FET, ~100 mΩ — no drop |
+
+The 0.34 V step is the signature. The switch *is* being controlled correctly; the rail
+is simply reachable without it.
+
+**The path.** The menu setting controls U14 only (`IN` = `V_BUS_FTDI`, `OUT` =
+`V_USB_LED` → F2 → `V_LED`). The brick also has a second, unswitched route to the same
+node:
+
+```
+V_BUS_FTDI → F1 (1.1 A) → D4 (B360A, cathode on 5V_LOGIC) → 5V_LOGIC
+                                                              ↓  L2      (bidirectional)
+                                                          V_LOGIC_IN
+                                                              ↓  F9      (bidirectional)
+                                                            V_LED
+```
+
+F1/D4 exists on purpose — it is what boots the logic so the operator can *reach* the
+menu and choose. D4 blocks `V_LED` → brick, not this direction. L2 and F9 are passive
+and conduct both ways, so `5V_LOGIC` ties straight back to `V_LED`. **U14 is bypassed.**
+
+**Why 5 V builds only.** `V_LOGIC_IN` → `5V_LOGIC` is **L2 *or* U6, exclusive**. On
+12/24 V builds U6 (OKI-78SR) is fitted and is unidirectional, so the strips genuinely
+stay dark — which is the case the Rev 2 design review reasoned about when it concluded
+"strips dark there, correctly". The 5 V variant, where that element is a plain
+inductor, was never re-checked against the same claim.
+
+**What it costs.**
+
+- **No current limiting.** The brightness budget is gated on `usb_power::brick_powering()`,
+  which requires `ST_ENABLED` — false here, because EN really is low. So the 1300 mA cap
+  never applies on this path. The only protection is F1 and F9, both 1.1 A hold.
+- **`External` is therefore the *least* protected mode, and it looks like the best one.**
+  Observed 2026-09-18 with the module USB and J2 both connected: the strips are visibly
+  **brighter** on `External` than on `USB brick`. That is not a power-path difference — it
+  is the budget doing its job in one mode and being absent in the other. At 20 mA per
+  channel the cap covers ~21 full-white RGB pixels, so 64 of them scale to 86/256 ≈ **34 %**
+  on `USB brick` and run at **100 %** on `External`, off the same USB sources. The mode
+  named for the mains supply is the one drawing unlimited current from a laptop.
+- **F18 is in the firing line too** when the module USB is also plugged in: that feed is
+  `D3 → F18 (0.5 A)`, in parallel with the F1/D4 route, and at full brightness it will
+  hold up briefly and then cycle. Watch for the strips pulsing rather than dimming.
+- **The property `External` exists for does not hold.** "A PC must never be loaded" is the
+  stated reason for the default, and on a 5 V build a PC on J2 feeds the strips through
+  this path. The design review separately noted the FT232RNL is declared self-powered at
+  ≤ 100 mA.
+- The module-USB dev feed (`D3` → F18 0.5 A → `V_LED`) is the same shape, and its
+  checklist item likewise expects "strips stay dark" with nothing in firmware to enforce it.
+
+**Fix — a series Schottky in the F9 branch. Adopted, and in the Altium design as of
+2026-09-18**; recorded on the hardware side as R6-P1 in
+`dmx_interface_dev_board_v2/docs/REV2_ALTIUM_REVIEW.md`. One part, between `F9` and
+`V_LOGIC_IN`, cathode toward `V_LOGIC_IN`:
+
+- Passes the normal direction (`V_LED` → logic), so J26 and the `USB brick` path are
+  unaffected.
+- Blocks `5V_LOGIC` → `V_LED`, so F1/D4 can still boot the logic while the strips stay
+  dark until the operator asks for them. That is exactly the behaviour the menu promises.
+- **Cost: ~0.35–0.4 V and ~0.25 W** at the ~0.7 A logic load. `5V_LOGIC` becomes ~4.6 V,
+  `VSYS` ~4.3 V after D2 — far above the module buck's floor. `5V_LVL_SHIFT` drops with
+  it, so the SN74ACT245 swings ~4.6 V into a WS2812 V_IH of 0.7 × V_LED = 3.5 V: still
+  comfortable, but note this breaks the "level shifter and strips track the same rail"
+  property in ARCHITECTURE §7 item 4, which is worth stating rather than discovering.
+- Placing it before the L2/U6 fork means one part covers every build variant; a
+  5 V-only variant part would avoid the drop on 12/24 V builds, at the cost of another
+  BOM line.
+
+**Part: B340A-13-F** (40 V, 3 A, SMA) — **D2 is already a B340A**, so this adds no new
+BOM line and no new footprint to a board that is already managing 5 V / 12 V / 24 V
+variants. Against the duty: ~0.5–0.7 A logic load (F9 sizing, review §173) into a 3 A
+part, and a worst-case reverse of ~4.65 V (`5V_LOGIC` back-feed with `V_LED` collapsed)
+against 40 V. Both comfortable, and the current headroom buys a lower V_f at the
+operating point. Confirm stock and price on the live product page rather than from the
+review’s 2026-09-03 figures.
+
+Two things about it that are easy to trip over:
+
+- **The drop only costs anything on 5 V builds.** On 12/24 V builds the diode sits in
+  front of U6, which *regulates*, so `5V_LOGIC` is untouched and the 0.4 V comes off a
+  12 or 24 V input U6 does not care about. That is also the only variant that needs the
+  fix, so fitting it everywhere is simply harmless.
+- **Schottky leakage means "dark", not "dead".** Reverse leakage at ~5 V is tens to
+  hundreds of µA over temperature, flowing the way this part exists to block, and
+  `V_LED` carries a 10 k bleed (R36). On a bare board that can hold the rail at a
+  meaningful voltage with nothing connected, which reads like the fix has not worked.
+  **Test with the strips attached** — their quiescent draw swamps it and nothing lights.
+  A silicon diode would leak far less but costs 0.7 V, pushing `VSYS` to ~3.9 V and
+  eating most of the margin; the Schottky is the better trade.
+
+**Decision (2026-09-18): the Schottky, and nothing else.**
+
+A J26 present-detect was considered as a complement, so firmware could apply the budget
+whenever the strips run off USB however they got there. **It was rejected because it
+does not work**, and the reasoning is recorded here so it is not re-proposed:
+
+- **There is no J26 node to sense.** J26 pins 5–8 *are* `V_LED` (review §55).
+- **J26 and the brick are ~100 mV apart by design.** Review §87 trims the J26 PSU to
+  ≥ 5.1 V so it carries the load when both are attached; the brick through U14 measures
+  5.00 V. Through a divider of the existing 10 k/20 k style that is **67 mV** at the pin,
+  inside a TCA9555 dead band of roughly **1.32 V** (0.3·V_CC to 0.7·V_CC). A logic input
+  cannot resolve it, and is off by a factor of twenty rather than marginally.
+- A single divider cannot even do plain presence across builds: ≥ 0.46 ratio is needed to
+  reach V_IH at 5 V, ≤ 0.14 to stay under 3.3 V at 24 V.
+- The ADC *could* resolve it — 8.2 k/10 k on a 5 V build puts J26 and the brick 68 counts
+  apart — but **all four ADC pins are allocated** (GP26/27 I²C, GP28 FTDI_TX, GP29 VSYS).
+  The only opening is GP28, unused in practice while U2 is unfitted. That is a pin
+  reassignment, not two resistors.
+
+With the diode fitted the real hazard is closed: a PC on J2 can no longer be loaded by
+the LED rail. The residual is the D3/F18 module-USB dev feed — bench-only, fused at
+0.5 A, and already visible to firmware through P06 if a policy is ever wanted. Policing
+that with an ADC channel and a pin reassignment is a large board change for little
+return.
+
+### The DTR gate silenced the logger (2026-09-17, reverted)
+
+The first cut of `usb_log.rs` held the drain until the host raised **DTR**, so
+that nothing reached the endpoint before the port was opened - a way of
+sidestepping the data-toggle bug without touching the driver. It also meant
+total silence on any terminal that does not raise DTR, which is what the bench
+saw: the port opened first time and printed nothing, button presses included.
+
+The gate is gone. It was a workaround, and `usb_toggle.rs` fixes the toggle at
+its source for every endpoint, so nothing depends on it. The drain now writes
+whenever the endpoint will take bytes, as `embassy-usb-logger` did - the
+backlog still survives, because `write_packet` blocks once the endpoint is
+full and the rest waits in the 4 KB pipe.
+
+Re-test: flash `pico2-usb.uf2`, open the **third** CDC port (highest COM number
+— Enttec widget, console, log, in interface order). It should connect first
+time, print the boot log from `DMX interface starting on RP2350` onwards, and
+survive a close and reopen. Check the Enttec widget and console ports still work
+too: the wrapper sits under all three.
+
+In `USB>DMX` the module enumerates as an **FT232R with one interface**, so only
+one port exists and it is not a CDC one. Windows keeps showing the three CDC
+entries from the other identity, greyed out as "not present"; they cannot be
+opened, and that is correct rather than a fault. There is no logging interface
+in that mode - use the default build and a probe to debug `USB>DMX`.
 
 ## Stage 9 — Robustness
 

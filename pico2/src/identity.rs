@@ -12,7 +12,17 @@
 //! unique per die and needs no provisioning step, which is the point: a unit
 //! straight off the assembly line is already distinguishable.
 
-use defmt::*;
+// Logging goes wherever the build says: `defmt` over RTT by default, the
+// `log` crate over USB with `--features usb`. Format strings therefore have
+// to parse as both - no `{=type}` hints. See `usb_log.rs`.
+use cfg_if::cfg_if;
+cfg_if! {
+    if #[cfg(feature = "usb")] {
+        use log::{warn};
+    } else {
+        use defmt::{warn};
+    }
+}
 use embassy_rp::otp;
 use static_cell::StaticCell;
 
@@ -54,4 +64,21 @@ pub fn usb_serial() -> &'static str {
 pub fn mac_fallback() -> [u8; 6] {
     let id = chip_id();
     [0x02, 0x44, 0x4D, (id >> 16) as u8, (id >> 8) as u8, id as u8]
+}
+
+/// A MAC as `aa:bb:cc:dd:ee:ff`, for log lines that must read the same under
+/// `defmt` and `log`.
+///
+/// `defmt` renders `{:02x}` over a `[u8; 6]` element by element; `core::fmt`
+/// has no such impl and will not compile. Rendering to a string first is what
+/// lets one format string serve both backends - see `usb_log.rs`.
+pub fn mac_text(mac: &[u8; 6]) -> heapless::String<17> {
+    use core::fmt::Write as _;
+    let mut out = heapless::String::new();
+    for (i, b) in mac.iter().enumerate() {
+        // The capacity is exact, so this cannot truncate; ignore the result
+        // rather than panicking inside a log call.
+        let _ = write!(out, "{}{:02x}", if i == 0 { "" } else { ":" }, b);
+    }
+    out
 }

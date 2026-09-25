@@ -27,10 +27,14 @@
 //! build uses `cortex-m/critical-section-single-core`; the host uses
 //! `critical-section/std`.
 
+use core::cell::Cell;
+
+use embassy_sync::blocking_mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use smart_leds::{White, RGBW};
 
+use crate::ui::fixtures::FixtureMap;
 use crate::{DMX_UNIVERSE_COUNT, DMX_UNIVERSE_SIZE, SMARTLED_NUM_LEDS_MAX, SMARTLED_PORT_COUNT};
 
 /// Raw mutex backing the shared buffers. See the module docs.
@@ -56,3 +60,31 @@ pub type DmxBuffer = Mutex<BufferRawMutex, [u8; DMX_UNIVERSE_COUNT * DMX_UNIVERS
 /// start code at index 0 — see `event_router::buffer_index` for how the two
 /// layouts are reconciled.
 pub static DMX_BUFFER: DmxBuffer = Mutex::new([0_u8; DMX_UNIVERSE_COUNT * DMX_UNIVERSE_SIZE]);
+
+/// The per-port fixture map.
+///
+/// A **blocking** mutex around a `Cell`, unlike the two buffers above, and
+/// deliberately so. The render already holds `DMX_BUFFER` and `LED_COLORS`
+/// across awaits; adding a third async lock would create an
+/// `LED_COLORS -> DMX_BUFFER -> FIXTURE_MAP` ordering that nothing enforces and
+/// that a future code path could take the other way round — a cross-core
+/// deadlock at 44 Hz, found on a rig rather than on the bench.
+///
+/// This one is never held across an await. The render takes a **snapshot**
+/// (`FIXTURE_MAP.lock(|m| m.get())`, 80 bytes) before it locks anything else,
+/// which also buys frame atomicity for free: a layout edited mid-frame cannot
+/// paint half of one arrangement and half of another. The UI writes it without
+/// ever waiting on the render.
+pub static FIXTURE_MAP: blocking_mutex::Mutex<BufferRawMutex, Cell<FixtureMap>> =
+    blocking_mutex::Mutex::new(Cell::new(FixtureMap::EMPTY));
+
+/// The current map, copied out. Cheap, and the only way the render should read
+/// it — see the note on lock ordering above.
+pub fn fixture_map() -> FixtureMap {
+    FIXTURE_MAP.lock(|m| m.get())
+}
+
+/// Replace the map. The caller is responsible for persisting it.
+pub fn set_fixture_map(map: FixtureMap) {
+    FIXTURE_MAP.lock(|m| m.set(map));
+}

@@ -19,6 +19,13 @@ lighting console. Standard library only.
 
 Ctrl-C stops early and still prints the statistics.
 
+The strips are blacked out on the way out, however the run ends, so a test does
+not leave a rig lit - `ramp` in particular drives every channel high, which on a
+full-length rig is real current. The blackout goes out several times because
+Art-Net and sACN are both unreliable transports and a single lost packet would
+leave the strips on. `--leave-on` keeps the last frame instead, for when you
+want a strip lit while probing something.
+
 Timing. Windows sleeps in ~15.6 ms steps unless a process asks for 1 ms, so a
 naive 44 Hz loop alternates 15.6 and 31.2 ms gaps that *average* 22.7 - two
 bursts land close together, then a long pause. That halved the apparent
@@ -224,6 +231,8 @@ def main() -> int:
                          "chase spends most of its time past the end of it.")
     ap.add_argument("--rate", type=float, default=44.0, help="frames per second per universe")
     ap.add_argument("--seconds", type=float, default=0.0, help="0 = until Ctrl-C")
+    ap.add_argument("--leave-on", action="store_true",
+                    help="do not black out on exit; leave the last frame displayed")
     ap.add_argument("--priority", type=int, default=100, help="sACN priority")
     args = ap.parse_args()
 
@@ -266,6 +275,47 @@ def main() -> int:
     print(f"  {'until Ctrl-C' if args.seconds <= 0 else f'{args.seconds:g} s'}")
     print()
 
+    def emit(data_for) -> tuple[int, int]:
+        """Send one frame to every universe in the span.
+
+        `data_for(i)` gives the slots for the i-th universe, so a pattern can
+        differ per port while a blackout is the same everywhere. Raises OSError
+        like the socket it wraps.
+        """
+        sent = size = 0
+        for i in range(args.count):
+            data = data_for(i)
+            if args.protocol == "artnet":
+                pkt = artnet_packet(first + i, sequence[i], data)
+                dest = (target, ART_NET_PORT)
+            else:
+                # E1.31 carries the slot count in its property-value field, so a
+                # short frame is legal there too.
+                pkt = sacn_packet(first + i, sequence[i], data, cid,
+                                  "DMX bring-up", args.priority)
+                dest = (sacn_group(first + i), SACN_PORT)
+            sock.sendto(pkt, dest)
+            sequence[i] = sequence[i] % 255 + 1
+            sent += 1
+            size += len(pkt)
+        return sent, size
+
+    def blackout(repeats: int = 3) -> None:
+        """Zero every slot the run could have set, several times over.
+
+        The same width as the run: the receiver writes only the slots a packet
+        carries, so a short blackout after a `--channels 64` run still clears
+        everything that run touched.
+        """
+        dark = bytes(args.channels)
+        for _ in range(repeats):
+            try:
+                emit(lambda _i: dark)
+            except OSError as e:
+                print(f"  (blackout send failed: {e})", file=sys.stderr)
+                return
+            time.sleep(0.02)
+
     period = 1.0 / args.rate
     _windows_timer(True)
     started = time.perf_counter()
@@ -285,31 +335,22 @@ def main() -> int:
             if now > next_frame + 0.002:
                 late += 1          # more than 2 ms behind schedule
             sent_at.append(now)
-            for i in range(args.count):
-                data = make_frame(args.pattern, colour, step, i, args.leds, args.channels)
-                if args.protocol == "artnet":
-                    pkt = artnet_packet(first + i, sequence[i], data)
-                    dest = (target, ART_NET_PORT)
-                else:
-                    # E1.31 carries the slot count in its property-value field, so a
-                    # short frame is legal there too.
-                    pkt = sacn_packet(first + i, sequence[i], data, cid,
-                                      "DMX bring-up", args.priority)
-                    dest = (sacn_group(first + i), SACN_PORT)
-                try:
-                    sock.sendto(pkt, dest)
-                except OSError as e:
-                    print(f"send failed: {e}", file=sys.stderr)
-                    return 1
-                packets += 1
-                payload += len(pkt)
-                sequence[i] = sequence[i] % 255 + 1
+            n, b = emit(lambda i: make_frame(args.pattern, colour, step, i,
+                                             args.leds, args.channels))
+            packets += n
+            payload += b
             frames += 1
             step += 1
             next_frame += period
     except KeyboardInterrupt:
         print("(stopped)")
+    except OSError as e:
+        print(f"send failed: {e}", file=sys.stderr)
+        return 1
     finally:
+        if not args.leave_on:
+            blackout()
+            print("  strips blacked out")
         sock.close()
         _windows_timer(False)
 

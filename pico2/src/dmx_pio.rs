@@ -7,7 +7,7 @@
 //!   low), waits for the Mark-After-Break, then shifts in one byte per DMX
 //!   slot. Each byte is pushed to the RX FIFO and drained into a buffer by
 //!   DMA.
-//! * TX: the state machine asserts a 176us BREAK and a 16us MAB, then
+//! * TX: the state machine asserts a 177us BREAK and a 16us MAB, then
 //!   shifts out one byte per DMX slot (8N2) fed from the TX FIFO by DMA.
 
 use embassy_rp::Peri;
@@ -177,7 +177,9 @@ impl<'d, PIO: Instance> PioDmxTxProgram<'d, PIO> {
         let prg = pio_asm!(
             ".side_set 1 opt",
             // Assert break condition
-            "    set x, 21          side 0",    // Preload bit counter, assert break condition for 176us
+            // BREAK starts on this instruction, so it is 1 + 22*8 = 177us, not the
+            // 176 the loop alone accounts for. Measured 177us on GP9, 2026-09-17.
+            "    set x, 21          side 0",    // Preload bit counter, start the BREAK
             "breakloop:",                       // This loop will run 22 times
             "    jmp x-- breakloop  [7]",       // Each loop iteration is 8 cycles
             // Assert start condition

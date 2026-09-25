@@ -108,7 +108,14 @@ Core 0:
   IGMP-snooping switch drops everything else upstream.
 - **`usb_device_task`** — composite CDC device on the module's USB: Enttec widget
   (label 6 in, label 5 out on change, labels 3/4/8/10 answered) + the console line
-  protocol (+ a `log` interface with the `usb` feature).
+  protocol (+ a `log` interface with the `usb` feature). Each CDC-ACM function
+  costs **two** interfaces, so the default build uses 4 and `--features usb`
+  uses 6; `embassy-usb`'s `max-interface-count` is raised to 8 in
+  `pico2/Cargo.toml` to suit. Overrunning it is an `assert!` inside the USB
+  builder, which on a board with no debugger reads as a dead unit rather than
+  as a USB fault — raise the count when adding a function.
+  In `USB>DMX` the same task builds an FT232R instead, one interface; see
+  `ftdi.rs`.
 - **`enttec_uart_task`** — the same widget on the carrier's FT232RNL (UART0, 8N2,
   **baud hunting** across the rates host software uses). This is the port QLC+
   and other FTDI-stack software recognise as a DMX USB Pro.
@@ -152,6 +159,8 @@ updated in the field.
 cargo uf2                        # builds pico2 --release, writes
                                  #   target/thumbv8m.main-none-eabihf/release/pico2.uf2
 cargo uf2 --features usb         # the USB-logger variant -> pico2-usb.uf2
+                                 #   log goes to the third CDC port instead of
+                                 #   RTT; use it when there is no probe
 cargo uf2 --no-build             # just convert the ELF already in target/ (whichever
                                  #   variant was built last — it is written as pico2.uf2)
 # then: hold BOOTSEL on the module while plugging its USB-C into a PC; it
@@ -195,9 +204,34 @@ Six pages on the TFT (title row shows the page and the network state):
   which base — e.g. `32 @ 0:0:0`; the same count the Art-Net replies advertise)
 - **Network** — IP mode (DHCP/Static, applies at boot), IP in use (read-only),
   static IP, prefix length, gateway (`0.0.0.0` = none; defaults 2.0.0.1/8)
-- **LED** — port mode (Individual/Mirror), colour mode (RGB/RGBW), universes
-  used, offsets
-- **Groups** — DMX group size per port (×8)
+- **LED** — **Mirror Ports** (Off/On: whether all eight ports share one DMX
+  block), colour mode (RGB/RGBW), universe offsets, and universes used with a
+  budget bar under it: 32 cells for the 64 universes, two each, red when the
+  configuration wants more than exist
+- **Layout** — **Grouping** (Individual / Groups / Fixtures) and then one row
+  per port. Grouping sits at the top because it decides what every row under it
+  means, and the rows are labelled just `Port 1`…`Port 8` for the same reason:
+  - `Individual` — every pixel its own channel. Rows read `001` and are **not
+    editable on the panel**: the size is pinned to 1 whatever is stored, so
+    dialling a number that changes nothing would only mislead. The console can
+    still set it — it is the value `Groups` goes back to.
+  - `Groups` — the row is that port's group size, editable as before
+  - `Fixtures` — the row is a picture of the strip: fixtures in alternating
+    blue and green, dark where nothing drives a LED, drawn to scale against
+    the longest port so lengths compare too. Selecting it opens that port's
+    table, where the numbers are. An unconfigured port is one lit LED
+    (`F001`)
+- **Fixtures P1–P8** — five rows per port, each a run: `F010` is a ten-LED
+  fixture, `G005` a five-LED gap, `----` an empty slot. The lit span each
+  fixture covers (`001-010`) is computed and shown beside it. Reached from
+  Layout, not from the Esc rotation; Esc goes back to Layout.
+  - **Starts are never stored**, only lengths and kinds, so a fixture cannot
+    overlap the one before it. The single rule left is that a port's total must
+    fit its LED count, which is enforced when you edit.
+  - Setting a length to `0` (or `----`) removes the entry; toggling an empty
+    slot creates one. There is no add/remove control to get out of step with it.
+  - Console: `fixture_<port>_<slot>`, both 1-based — e.g.
+    `set fixture_1_3 G005`
 - **LEDs** — LEDs per port (×8, up to 600)
 - **System** — Ethernet enable (applies at boot), backlight, LED Power
   (External / USB brick)
@@ -205,7 +239,24 @@ Six pages on the TFT (title row shows the page and the network state):
 Buttons: Up/Down move the selection (crossing a page edge changes page), Select
 starts editing, Esc jumps to the next page. While editing, Up/Down change the
 highlighted digit (or cycle an enum), Select moves to the next digit and commits
-after the last one (written to EEPROM), Esc cancels.
+after the last one (written to EEPROM), Esc cancels. The bottom row of every
+page says the same thing for the row that is selected (`Sel edit`, `Sel open`
+for a port's fixture table, `Esc back` inside one).
+
+What the panel's colours mean: the title bar is a different colour per page;
+the selected row is a dark blue bar; labels are grey and values white; blue is
+a value the board worked out rather than one you set; a greyed row does not
+apply in the current mode; amber is a note. The disc beside the IP in the title
+bar is the **activity lamp**: blue while DMX frames are reaching the router
+from any input (wired, Art-Net, sACN, USB), grey a second after the last one.
+
+At boot the panel shows a wordmark and a six-stripe flag for 1.5 s (any button
+ends it sooner) with the network status in the corner, then the menu. After
+30 s without a button the menu gives way to an **idle screen**: the DMX address
+in large seven-segment digits, a bar per port drawn to scale with its
+fixtures, the input mode and what it is bound to, the IP, the channel count,
+the power note and the activity lamp. Any button brings the menu back where it
+was.
 
 ## Host console (dmx_console)
 
@@ -228,7 +279,15 @@ cd host_tests && cargo test     # settings model, field metadata/editing, sACN +
                                 # DMX addressing convention, WS2812 packing, USB-brick current budget
 cd dmx_console && cargo test    # console protocol line parser
 cd pico2 && cargo clippy --release --bins
+cd pico2 && cargo build --release --features usb   # the other logging backend
 ```
+
+That last one is not optional. **Every** firmware file picks its logging macros
+with `cfg_if`, so every format string has to parse as both `defmt` and
+`core::fmt`: no `{=u8:#04x}` type hints, and nothing that leans on a `defmt`
+convenience `core::fmt` lacks (`{:02x}` over a `[u8; 6]` is the one that bites -
+use `identity::mac_text`). Either mistake compiles clean by default and fails
+only under `--features usb`.
 
 Hardware-facing code (PIO, SPI, I²C, USB, Ethernet) is verified on the bench
 against [docs/BRINGUP.md](docs/BRINGUP.md), the stage-by-stage bring-up checklist.

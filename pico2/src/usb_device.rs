@@ -44,8 +44,7 @@ cfg_if! {
 }
 
 use embassy_futures::select::{Either, select};
-use embassy_rp::peripherals;
-use embassy_rp::usb::Driver;
+use crate::usb_toggle::{UsbClass, UsbDriver};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use cortex_m::peripheral::SCB;
@@ -58,8 +57,6 @@ use crate::enttec_protocol::{EnttecParser, MAX_PAYLOAD};
 use crate::enttec_widget::{handle_message, ChangeForwarder, MSG_MAX};
 use crate::event_router::DmxFeedbackEvent;
 use crate::ui::InputMode;
-
-type UsbClass<'d> = CdcAcmClass<'d, Driver<'d, peripherals::USB>>;
 
 /// Send a framed message chunked into full-speed USB packets, with a ZLP when
 /// the total lands on a packet boundary so the host flushes the transfer.
@@ -95,7 +92,7 @@ const MODE_WAIT: Duration = Duration::from_secs(2);
 /// peripheral for the life of the board.
 #[embassy_executor::task]
 pub async fn usb_device_task(
-    driver: Driver<'static, peripherals::USB>,
+    driver: UsbDriver,
     tx: DmxChannelTx,
     mut rx: DmxFeedbackChannelRx,
     router_tx: RouterChannelTx,
@@ -216,7 +213,7 @@ pub async fn usb_identity_watch_task(mut global_rx: GlobalDataChannelRx) -> ! {
 /// The composite CDC device: Enttec widget + console (+ logger).
 #[allow(clippy::too_many_arguments)]
 async fn run_cdc(
-    driver: Driver<'static, peripherals::USB>,
+    driver: UsbDriver,
     tx: DmxChannelTx,
     mut rx: DmxFeedbackChannelRx,
     router_tx: RouterChannelTx,
@@ -232,6 +229,14 @@ async fn run_cdc(
     // COM-port bindings.
     config.serial_number = Some(serial);
     config.max_packet_size_0 = 64;
+    // `embassy_usb::Config::new` defaults to 100 mA, which this board does not
+    // honour: the RP2350 and the W6300 together are about 200 mA before the TFT
+    // backlight, and `LedPower::Usb` puts a strip on top of that. A descriptor
+    // that under-declares is a bug whatever the host does with it - most PCs
+    // ignore bMaxPower, but a bus-powered hub enforcing its budget is entitled
+    // to cut the port. The FTDI identity keeps its own 90 mA on purpose, to
+    // match real FT232R silicon; see `ftdi.rs`.
+    config.max_power = 500;
     // Composite device with Interface Association Descriptors: without them
     // Windows will not bind its CDC driver to each serial function separately.
     // Verified on the rp2040_dmx bench firmware, which uses the same layout.
@@ -316,7 +321,10 @@ async fn run_cdc(
 
     cfg_if! {
         if #[cfg(feature = "usb")] {
-            let logger = embassy_usb_logger::with_class!(1024, log::LevelFilter::Info, logger_class);
+            // `crate::usb_log`, not `embassy-usb-logger`: the sink was
+            // installed in `main`, and this only drains once the host opens
+            // the port. See that module for why that matters.
+            let logger = crate::usb_log::run(logger_class);
             embassy_futures::join::join4(usb.run(), protocol, console, logger).await;
         } else {
             embassy_futures::join::join3(usb.run(), protocol, console).await;

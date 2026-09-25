@@ -58,7 +58,17 @@ use common::ui::{BootStatus, MenuData, ModuleType};
 //
 // If a write ever fails again, look at those three properties before re-adding
 // a priming write: it never fixed anything, it only made the gap wider.
-use defmt::*;
+// Logging goes wherever the build says: `defmt` over RTT by default, the
+// `log` crate over USB with `--features usb`. Format strings therefore have
+// to parse as both - no `{=type}` hints. See `usb_log.rs`.
+use cfg_if::cfg_if;
+cfg_if! {
+    if #[cfg(feature = "usb")] {
+        use log::{error, info, warn};
+    } else {
+        use defmt::{error, info, warn};
+    }
+}
 use embassy_time::{with_timeout, Duration};
 use embedded_hal_async::i2c::I2c;
 
@@ -78,6 +88,28 @@ pub const SETTINGS_ADDR: u8 = 0x20;
 /// completed boot. A blank byte (0xFF) reads as zero.
 pub const BOOT_FAIL_COUNT_ADDR: u8 = 0xA0;
 
+/// Fixture-map header: magic, format version, CRC-16. Five bytes inside the
+/// single page `0xA0..=0xAF`, so it is one write that cannot straddle a page
+/// boundary.
+pub const FIXTURE_HEADER_ADDR: u8 = 0xA1;
+
+/// Fixture-map payload, 80 B. Page-**aligned** on purpose: `write_page` rejects
+/// any write crossing a 16-byte boundary, and starting on one keeps the chunker
+/// a plain `chunks(PAGE_SIZE)` with no special first case.
+pub const FIXTURE_PAYLOAD_ADDR: u8 = 0xB0;
+
+/// `0xB0 + 80 = 0x100`, i.e. exactly the end of the part. One byte more would
+/// wrap to address 0 and overwrite the module-type marker.
+const _: () = core::assert!(
+    FIXTURE_PAYLOAD_ADDR as usize + FIXTURE_PAYLOAD_LEN == 256,
+    "the fixture payload must end exactly at the top of the M24C02"
+);
+/// The header must not run into the payload, nor over the boot-fail counter.
+const _: () = core::assert!(FIXTURE_HEADER_ADDR > BOOT_FAIL_COUNT_ADDR);
+const _: () = core::assert!(
+    FIXTURE_HEADER_ADDR as usize + FIXTURE_HEADER_LEN <= FIXTURE_PAYLOAD_ADDR as usize
+);
+
 /// Bytes reserved for the settings blob — defined in `common` so the host
 /// tests check the worst-case encoding against this exact value.
 ///
@@ -88,6 +120,9 @@ pub const BOOT_FAIL_COUNT_ADDR: u8 = 0xA0;
 /// written, so the larger reservation costs nothing at runtime.
 pub use common::SETTINGS_SIZE;
 
+use common::buffers::{fixture_map, set_fixture_map};
+use common::ui::fixtures::{FixtureMap, FIXTURE_HEADER_LEN, FIXTURE_PAYLOAD_LEN};
+
 /// Bump when the encoded shape of `MenuData` changes. A stored value that does
 /// not match means the settings blob is from an older layout and must not be
 /// decoded.
@@ -97,7 +132,10 @@ pub use common::SETTINGS_SIZE;
 /// * 3 — `static_ip`, `static_prefix`, `static_gateway` appended
 /// * 4 — `led_power` appended (USB-brick LED supply); the dead PWM module
 ///   variants removed from `ModuleType` / `ModuleSettings`
-pub const SCHEMA_VERSION: u8 = 4;
+/// * 5 — `grouping` appended to `SmartLedSettings` (Individual / Groups /
+///   Fixtures). The fixture map itself is a **separate** blob outside this slot
+///   with its own header and CRC; see `FIXTURE_*` below.
+pub const SCHEMA_VERSION: u8 = 5;
 
 /// Read the MAC address, rejecting anything that is not a usable unicast
 /// address.
@@ -122,11 +160,11 @@ pub async fn read_mac<I2C: I2c>(dev: &mut M24x02<I2C>) -> Option<[u8; 6]> {
         return None;
     }
     if mac[0] & 0x01 != 0 {
-        warn!("EEPROM: MAC {:02x} has the multicast bit set", mac);
+        warn!("EEPROM: MAC {} has the multicast bit set", crate::identity::mac_text(&mac));
         return None;
     }
 
-    info!("EEPROM: MAC {:02x}", mac);
+    info!("EEPROM: MAC {}", crate::identity::mac_text(&mac));
     Some(mac)
 }
 
@@ -252,7 +290,7 @@ impl<I2C: I2c> Eeprom<I2C> {
                         if v == 0xFF {
                             info!("EEPROM: blank, settings default");
                         } else {
-                            warn!("EEPROM: schema {=u8} != {=u8}, settings default", v, SCHEMA_VERSION);
+                            warn!("EEPROM: schema {} != {}, settings default", v, SCHEMA_VERSION);
                         }
                         let _ = self.tx.try_send(RouterEvent::StoreSettings(Some(MenuData::default())));
                         return Ok(());
@@ -275,7 +313,7 @@ impl<I2C: I2c> Eeprom<I2C> {
                         let decoded: MenuData = match bincode::decode_from_slice(&buf, bincode::config::standard()) {
                             Ok((d, _)) => d,
                             Err(_) => {
-                                warn!("EEPROM: settings blob failed to decode under schema {=u8} - corrupt, using defaults", SCHEMA_VERSION);
+                                warn!("EEPROM: settings blob failed to decode under schema {} - corrupt, using defaults", SCHEMA_VERSION);
                                 MenuData::default()
                             }
                         };
@@ -345,6 +383,70 @@ impl<I2C: I2c> Eeprom<I2C> {
                         return Err(());
                     }
                 }
+            }
+            EepromEvent::ReadFixtures => {
+                let mut header = [0_u8; FIXTURE_HEADER_LEN];
+                let mut payload = [0_u8; FIXTURE_PAYLOAD_LEN];
+                let ok = self.dev.read_data(FIXTURE_HEADER_ADDR, &mut header).await.is_ok()
+                    && self.dev.read_data(FIXTURE_PAYLOAD_ADDR, &mut payload).await.is_ok();
+
+                // Anything short of a clean read is EMPTY, and EMPTY is safe:
+                // every port falls back to its `Groups` layout rather than going
+                // dark. A blank part, a board upgraded from an older firmware
+                // and a torn write all land here, and none of them is an error
+                // worth stopping the boot for.
+                let map = if ok {
+                    match FixtureMap::decode(&header, &payload) {
+                        Some(m) => {
+                            info!("EEPROM: fixture map loaded");
+                            m
+                        }
+                        None => {
+                            info!("EEPROM: no valid fixture map, ports use their group sizes");
+                            FixtureMap::EMPTY
+                        }
+                    }
+                } else {
+                    warn!("EEPROM: fixture map unreadable, ports use their group sizes");
+                    FixtureMap::EMPTY
+                };
+                set_fixture_map(map);
+            }
+            EepromEvent::WriteFixtures => {
+                // Read the static rather than a payload carried on the event:
+                // `CHANNEL_EEPROM` is depth 1 with `try_send`, so a second edit
+                // can drop the first. Taking the latest state here makes that
+                // drop harmless instead of a lost save.
+                let map = fixture_map();
+                let mut payload = [0_u8; FIXTURE_PAYLOAD_LEN];
+                map.encode(&mut payload);
+
+                // Three phases, stricter than the settings blob. Schema-last
+                // works there only because bincode fails to decode a torn blob;
+                // every bit pattern here is a legal layout, so a half-written
+                // one would render as a plausible rig. Invalidating the magic
+                // first means an interrupted write reads back as "no map".
+                if let Err(e) = self.dev.write_byte_wait(FIXTURE_HEADER_ADDR, 0xFF).await {
+                    error!("Fixture magic invalidate error {:?}", e);
+                    return Err(());
+                }
+
+                for (num, chunk) in payload.chunks(PAGE_SIZE as usize).enumerate() {
+                    let mem_addr = FIXTURE_PAYLOAD_ADDR + (num as u8) * PAGE_SIZE;
+                    if let Err(e) = self.dev.write_page_wait(mem_addr, chunk).await {
+                        error!("Fixture chunk {:?}/{:?} error {:?}", num, mem_addr, e);
+                        return Err(());
+                    }
+                }
+
+                // Header last: magic, version and the CRC over what was just
+                // written. Until this lands the region is explicitly invalid.
+                let header = FixtureMap::header(&payload);
+                if let Err(e) = self.dev.write_page_wait(FIXTURE_HEADER_ADDR, &header).await {
+                    error!("Fixture header write error {:?}", e);
+                    return Err(());
+                }
+                info!("EEPROM: fixture map stored");
             }
             EepromEvent::WriteBootStatus(status) => {
                 let mut slice = [0u8; 1];

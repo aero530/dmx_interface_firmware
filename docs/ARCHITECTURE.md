@@ -309,7 +309,15 @@ otherwise mis-decode an old EEPROM into plausible-looking garbage. The schema
 byte turns that into a detected mismatch and a clean fall back to defaults, and
 is written *last* so a torn write fails safe. Schema history: 2 added
 `sacn_universe` and `backlight`; 3 the static-IP fields; **4** `led_power`, and
-removed the dead PWM module variants.
+removed the dead PWM module variants; **5** `grouping`.
+
+`grouping` selects how a strip is divided — `Individual` / `Groups` /
+`Fixtures` — and is orthogonal to `port_mode`, which decides whether ports
+*share* a DMX block. `Individual` is not a separate layout: it is `Groups` with
+every size pinned to 1, routed through `SmartLedSettings::effective_group_size`
+so the two are identical by construction rather than by two code paths agreeing.
+The `Fixtures` map is too large for this slot and lives in its own EEPROM blob
+with its own header and CRC.
 
 `host_tests` asserts the worst-case encoding leaves real margin in the 128 B
 slot, so the next field added fails there first rather than silently on hardware.

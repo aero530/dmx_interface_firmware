@@ -30,7 +30,17 @@
 //! redesign was never diagnosed and now never can be, this is the board's own
 //! account of what went wrong. See `docs/ARCHITECTURE.md` §10.
 
-use defmt::*;
+// Logging goes wherever the build says: `defmt` over RTT by default, the
+// `log` crate over USB with `--features usb`. Format strings therefore have
+// to parse as both - no `{=type}` hints. See `usb_log.rs`.
+use cfg_if::cfg_if;
+cfg_if! {
+    if #[cfg(feature = "usb")] {
+        use log::{debug, error, info, warn};
+    } else {
+        use defmt::{debug, error, info, warn};
+    }
+}
 use embassy_net_wiznet::chip::W6300;
 use embassy_net_wiznet::{Device, InitError, Runner, State};
 use embassy_rp::gpio::{Input, Output};
@@ -222,7 +232,7 @@ async fn tune_clock(parts: &mut SpiParts, reset: &mut Output<'static>) -> Option
         seen = last;
         crate::diag::set_eth_version(seen);
         if !clean {
-            debug!("W6300: {} Hz -> version {=u8:#04x}, want {=u8:#04x}", freq, seen, CHIP_VERSION);
+            debug!("W6300: {} Hz -> version {:#04x}, want {:#04x}", freq, seen, CHIP_VERSION);
             continue;
         }
 
@@ -258,7 +268,7 @@ async fn tune_clock(parts: &mut SpiParts, reset: &mut Output<'static>) -> Option
         return None;
     }
     error!(
-        "W6300: no clock from {} down to {} Hz reads the version register; last was {=u8:#04x}",
+        "W6300: no clock from {} down to {} Hz reads the version register; last was {:#04x}",
         PROBE_FREQS_HZ[0],
         PROBE_FREQS_HZ[PROBE_FREQS_HZ.len() - 1],
         seen
@@ -287,7 +297,7 @@ pub async fn init(
 
     match embassy_net_wiznet::new(mac_addr, state, spi_dev, int, reset).await {
         Ok((device, runner)) => {
-            info!("W6300: up, MAC {:02x}", mac_addr);
+            info!("W6300: up, MAC {}", crate::identity::mac_text(&mac_addr));
             crate::diag::set(crate::diag::ETH_OK);
             crate::diag::set_eth_version(CHIP_VERSION);
             Some((device, runner))
@@ -304,7 +314,7 @@ pub async fn init(
             // The byte itself is the diagnosis, so it goes where a board with
             // no probe attached can be asked for it: `info` on the USB console.
             error!(
-                "W6300: ETH_CHIP_BAD_VERSION - expected {=u8:#04x}, got {=u8:#04x}",
+                "W6300: ETH_CHIP_BAD_VERSION - expected {:#04x}, got {:#04x}",
                 expected, actual
             );
             crate::diag::set(crate::diag::ETH_BAD_VERSION);

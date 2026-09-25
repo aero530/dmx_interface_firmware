@@ -124,6 +124,16 @@ pub enum EepromEvent {
     ReadBootStatus,
     /// Write boot_successful flag to EEPROM
     WriteBootStatus(BootStatus),
+    /// Read the fixture map from EEPROM into `buffers::FIXTURE_MAP`.
+    ReadFixtures,
+    /// Persist whatever `buffers::FIXTURE_MAP` currently holds.
+    ///
+    /// **Carries no payload on purpose.** `CHANNEL_EEPROM` is depth 1 and sent
+    /// with `try_send`, so two edits in quick succession would drop one of
+    /// them. Because the task reads the static rather than a copy taken at send
+    /// time, a dropped duplicate is harmless - whichever write does run
+    /// persists the latest state.
+    WriteFixtures,
 }
 
 /// Where the network stands, for the status line on the display and the

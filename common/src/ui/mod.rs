@@ -11,3 +11,6 @@ pub use types::*;
 
 pub mod fields;
 pub use fields::{all_fields, FieldId, Page, PAGES};
+
+pub mod fixtures;
+pub use fixtures::{FixtureEntry, FixtureMap, MAX_FIXTURES_PER_PORT};
