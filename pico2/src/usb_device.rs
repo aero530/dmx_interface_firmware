@@ -32,7 +32,13 @@
 //! is always the Enttec widget, interface 2 is always the console line protocol
 //! (see `console_usb.rs`), and with the `usb` logging feature enabled a third
 //! CDC-ACM interface carries the `log` output. The host sees the serial ports
-//! in that order.
+//! in that order. Last comes one vendor interface with no endpoints: picotool's
+//! **reset interface** (class `0xFF`, subclass `0x00`, protocol `0x01`, the
+//! pico-sdk `pico_stdio_usb` convention), so `picotool load -f -x pico2.uf2`
+//! can reboot a running unit into BOOTSEL, flash it and restart it with no
+//! button pressed. Windows binds WinUSB to it on its own because the device
+//! carries an MS OS 2.0 descriptor saying so. The FTDI identity cannot have
+//! it: it has to stay a single, non-composite interface.
 
 use cfg_if::cfg_if;
 cfg_if! {
@@ -45,12 +51,16 @@ cfg_if! {
 
 use embassy_futures::select::{Either, select};
 use crate::usb_toggle::{UsbClass, UsbDriver};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
-use cortex_m::peripheral::SCB;
+use common::events::RebootRequest;
 use embassy_time::{Duration, Timer, with_timeout};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+use embassy_usb::control::{OutResponse, Recipient, Request, RequestType};
 use embassy_usb::driver::EndpointError;
+use embassy_usb::msos::{self, CompatibleIdFeatureDescriptor, PropertyData, RegistryPropertyFeatureDescriptor};
+use embassy_usb::types::InterfaceNumber;
+use embassy_usb::Handler;
 
 use crate::channels::{DmxChannelTx, DmxFeedbackChannelRx, GlobalDataChannelRx, RouterChannelTx};
 use crate::enttec_protocol::{EnttecParser, MAX_PAYLOAD};
@@ -77,6 +87,60 @@ async fn send_bytes(class: &mut UsbClass<'_>, bytes: &[u8]) -> Result<(), Endpoi
 /// they issue for RP2350-based products. This is the only place to change it.
 pub const USB_VID: u16 = 0xc0de;
 pub const USB_PID: u16 = 0xdcaf;
+
+/// picotool's reset interface, as pico-sdk's `pico_stdio_usb` defines it:
+/// a vendor interface picotool recognises by subclass and protocol, and two
+/// class-type control requests to it.
+const RESET_SUBCLASS: u8 = 0x00;
+const RESET_PROTOCOL: u8 = 0x01;
+/// Reboot into BOOTSEL. wValue bits 0-6 are the bootrom's interface-disable
+/// mask; bit 8 and above name an activity LED, which this board ignores.
+const RESET_REQUEST_BOOTSEL: u8 = 0x01;
+/// Plain reboot into the application.
+const RESET_REQUEST_FLASH: u8 = 0x02;
+/// bMS_VendorCode for the MS OS 2.0 descriptor set (pico-sdk uses 1 too).
+const MSOS_VENDOR_CODE: u8 = 0x01;
+/// The device-interface GUID Windows files the reset interface under; the one
+/// pico-sdk ships, so a PC that has met a Pico already knows it.
+const RESET_INTERFACE_GUID: &str = "{bc7398c1-73cd-4cb7-98b8-913a8fca7bf6}";
+
+/// Answers picotool on the reset interface.
+///
+/// Accepts the request (so the host sees a clean status stage) and hands the
+/// reboot to `reboot.rs`, which waits for boot-complete and a short settle
+/// before acting. pico-sdk reboots inside the request itself and picotool copes
+/// with the resulting pipe error; finishing the transfer first is kinder.
+struct ResetInterface {
+    interface: InterfaceNumber,
+}
+
+impl Handler for ResetInterface {
+    fn control_out(&mut self, req: Request, _data: &[u8]) -> Option<OutResponse> {
+        if req.request_type != RequestType::Class
+            || req.recipient != Recipient::Interface
+            || req.index != u16::from(u8::from(self.interface))
+        {
+            return None;
+        }
+        match req.request {
+            RESET_REQUEST_BOOTSEL => {
+                let disable_mask = (req.value & 0x7F) as u8;
+                info!("USB: picotool asked for BOOTSEL (disable mask {:#04x})", disable_mask);
+                crate::reboot::request(RebootRequest::Bootsel { disable_mask });
+                Some(OutResponse::Accepted)
+            }
+            RESET_REQUEST_FLASH => {
+                info!("USB: picotool asked for a reboot");
+                crate::reboot::request(RebootRequest::Flash);
+                Some(OutResponse::Accepted)
+            }
+            other => {
+                warn!("USB: unknown reset-interface request {:#04x}", other);
+                Some(OutResponse::Rejected)
+            }
+        }
+    }
+}
 
 /// How long to wait for the stored input mode before giving up and building
 /// the CDC device.
@@ -136,29 +200,8 @@ const IDENTITY_UNCHOSEN: u8 = 0;
 const IDENTITY_CDC: u8 = 1;
 const IDENTITY_FTDI: u8 = 2;
 
-/// Set by `boot_task` when **this** boot finishes.
-///
-/// `GlobalData::boot_status` cannot do this job: it is read from the EEPROM
-/// early in `boot_task` and describes the *previous* boot, so on any healthy
-/// board it already says `Success` while this boot is still starting. Guarding
-/// on it looked right and guarded nothing.
-static BOOT_COMPLETE: AtomicBool = AtomicBool::new(false);
-
-/// Called by `boot_task` at each of its exits.
-pub fn mark_boot_complete() {
-    BOOT_COMPLETE.store(true, Ordering::Relaxed);
-}
-
-/// How long to let the dust settle before resetting.
-///
-/// The mode only reaches this watcher once the EEPROM has confirmed the write
-/// (the router re-broadcasts on the echo), so this is not waiting for the save.
-/// It gives the log a moment to drain and the operator a moment to see the
-/// panel, which beats the screen going black mid-keypress.
-const REBOOT_SETTLE: Duration = Duration::from_millis(750);
-
-/// Reboot when the stored mode needs a USB identity other than the one this
-/// boot built.
+/// Ask for a reboot when the stored mode needs a USB identity other than the
+/// one this boot built.
 ///
 /// USB identity is fixed at enumeration: a device cannot become an FT232R
 /// while attached. Crossing into or out of `USB>DMX` therefore needs a restart,
@@ -169,12 +212,13 @@ const REBOOT_SETTLE: Duration = Duration::from_millis(750);
 ///
 /// * **The USB identity must have been chosen.** Not merely defaulted - see
 ///   [`USB_IDENTITY`]. Comparing against a default is what caused a boot loop.
-/// * **This boot must have completed**, tracked by `mark_boot_complete` rather
-///   than by `GlobalData::boot_status`, which describes the *previous* boot.
-///   `boot_task` writes `BootStatus::Failed` on the way in and `Success` at the
-///   end, and two consecutive incomplete boots trip the guard that disables
-///   Ethernet - so resetting mid-boot would take Ethernet out after two mode
-///   changes.
+/// * **This boot must have completed**, tracked by `reboot::mark_boot_complete`
+///   rather than by `GlobalData::boot_status`, which describes the *previous*
+///   boot. `boot_task` writes `BootStatus::Failed` on the way in and `Success`
+///   at the end, and two consecutive incomplete boots trip the guard that
+///   disables Ethernet - so resetting mid-boot would take Ethernet out after
+///   two mode changes. (`reboot_task` checks this too; checking it here as
+///   well keeps a mode change during boot from even queueing a request.)
 /// * **The setting must have reached the EEPROM.** The mode only arrives here
 ///   through `StoreSettings`, which the EEPROM task sends *after* a successful
 ///   write - so by the time this sees it, a reboot will read it back.
@@ -192,7 +236,7 @@ pub async fn usb_identity_watch_task(mut global_rx: GlobalDataChannelRx) -> ! {
             // The USB task has not decided yet. Nothing to compare against.
             continue;
         }
-        if !BOOT_COMPLETE.load(Ordering::Relaxed) {
+        if !crate::reboot::boot_complete() {
             // Resetting now would be counted against the Ethernet lockout guard.
             continue;
         }
@@ -205,8 +249,9 @@ pub async fn usb_identity_watch_task(mut global_rx: GlobalDataChannelRx) -> ! {
             data.menu_settings.input_mode,
             if wants_ftdi { "FT232R" } else { "CDC" }
         );
-        Timer::after(REBOOT_SETTLE).await;
-        SCB::sys_reset();
+        // `reboot_task` settles and resets; this loop keeps watching, and a
+        // repeat request before the reset lands changes nothing.
+        crate::reboot::request(RebootRequest::Flash);
     }
 }
 
@@ -245,9 +290,18 @@ async fn run_cdc(
     config.device_sub_class = 0x02;
     config.device_protocol = 0x01;
     config.composite_with_iads = true;
+    // Bumped from the 0x0010 default when the reset interface and its MS OS
+    // descriptor arrived (2026-10-16). Windows remembers, per VID/PID/bcdDevice,
+    // whether a device answered the MS OS descriptor query; a PC that met the
+    // old firmware would never ask again and never bind WinUSB. bcdDevice is
+    // not part of the composite child instance IDs, so COM port numbers keep.
+    config.device_release = 0x0020;
 
     let mut config_descriptor = [0; 320];
     let mut bos_descriptor = [0; 256];
+    // The MS OS 2.0 set: header, configuration subset, one function subset
+    // with a compatible ID and a registry property - about 180 bytes.
+    let mut msos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
     let mut state = State::new();
     // Declared alongside the other USB state so they outlive everything
@@ -255,8 +309,20 @@ async fn run_cdc(
     let mut console_state = State::new();
     #[cfg(feature = "usb")]
     let mut logger_state = State::new();
+    let mut reset = ResetInterface { interface: InterfaceNumber(0) };
 
-    let mut builder = embassy_usb::Builder::new(driver, config, &mut config_descriptor, &mut bos_descriptor, &mut [], &mut control_buf);
+    let mut builder = embassy_usb::Builder::new(
+        driver,
+        config,
+        &mut config_descriptor,
+        &mut bos_descriptor,
+        &mut msos_descriptor,
+        &mut control_buf,
+    );
+    // Before any function, so the per-function MS OS features below have a
+    // set to land in. Windows 8.1 is the first version that reads MS OS 2.0.
+    builder.msos_descriptor(msos::windows_version::WIN8_1, MSOS_VENDOR_CODE);
+
     let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
 
     // Second CDC-ACM interface: console line protocol.
@@ -265,6 +331,23 @@ async fn run_cdc(
     // Third CDC-ACM interface carrying the `log` output.
     #[cfg(feature = "usb")]
     let logger_class = CdcAcmClass::new(&mut builder, &mut logger_state, 64);
+
+    // Last, so the CDC interface numbers - and with them the `MI_xx` child IDs
+    // Windows binds COM ports to - stay exactly what they were. picotool's
+    // reset interface: no endpoints, just the two control requests.
+    {
+        let mut function = builder.function(0xFF, RESET_SUBCLASS, RESET_PROTOCOL);
+        // What makes Windows load WinUSB for this interface unprompted.
+        function.msos_feature(CompatibleIdFeatureDescriptor::new("WINUSB", ""));
+        function.msos_feature(RegistryPropertyFeatureDescriptor::new(
+            "DeviceInterfaceGUIDs",
+            PropertyData::RegMultiSz(&[RESET_INTERFACE_GUID]),
+        ));
+        let mut interface = function.interface();
+        reset.interface = interface.interface_number();
+        let _alt = interface.alt_setting(0xFF, RESET_SUBCLASS, RESET_PROTOCOL, None);
+    }
+    builder.handler(&mut reset);
 
     let mut usb = builder.build();
 

@@ -188,7 +188,8 @@ async fn handle_line(
             // One snapshot for the whole listing, so a layout edited part-way
             // through cannot be reported half one way and half the other.
             let fixtures = fixture_map();
-            for field in all_fields() {
+            // Actions have no value to report - see `FieldId::is_action`.
+            for field in all_fields().filter(|f| !f.is_action()) {
                 let value = if field.fixture_slot().is_some() {
                     // Not in `MenuData` - `display()` would render the `----`
                     // placeholder. See `FieldId::fixture_display`.

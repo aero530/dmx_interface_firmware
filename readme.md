@@ -156,9 +156,10 @@ product defaults: Ethernet **on**, DMX mode, 150 LEDs per port, backlight 200.
 
 ### Build / flash
 
-Two routes. **SWD with a probe** gives you the defmt log and is what the bench
-stages use; **UF2 over USB** needs nothing but a cable and is how a unit gets
-updated in the field.
+Three routes. **SWD with a probe** gives you the defmt log and is what the
+bench stages use. **UF2 over USB** needs nothing but a cable and is how a unit
+gets updated in the field: the first time, by holding BOOTSEL; after that,
+**without the button**, from the front panel or with one picotool command.
 
 ```
 # --- UF2 over USB (from the repo root) -------------------------------------
@@ -169,9 +170,23 @@ cargo uf2 --features usb         # the USB-logger variant -> pico2-usb.uf2
                                  #   RTT; use it when there is no probe
 cargo uf2 --no-build             # just convert the ELF already in target/ (whichever
                                  #   variant was built last — it is written as pico2.uf2)
-# then: hold BOOTSEL on the module while plugging its USB-C into a PC; it
-# enumerates as a mass-storage drive (RP2350). Copy pico2.uf2 onto it — the
-# module flashes itself and reboots. No picotool, no probe.
+# first load of a blank module: hold BOOTSEL while plugging its USB-C into a
+# PC; it enumerates as a mass-storage drive (RP2350). Copy pico2.uf2 onto it —
+# the module flashes itself and reboots. No picotool, no probe.
+
+# --- updating a running unit, no button (the module is in its enclosure) ---
+# From the panel, in any mode: System -> Firmware (shows the running version)
+# -> Select arms it ("Sel again" in amber), Select again reboots into the USB
+# drive; Esc, Up or Down, or 10 s of nothing, disarms. The panel shows
+# "USB drive mode" while the RP2350 drive is mounted; copy pico2.uf2 as above.
+#
+# With picotool (v2.x), in any mode except USB>DMX - one command reboots the
+# unit into BOOTSEL, flashes, and starts the new firmware:
+picotool load -f -x target/thumbv8m.main-none-eabihf/release/pico2.uf2
+# The first time a Windows PC sees the unit it binds WinUSB to the reset
+# interface by itself (MS OS descriptors); no Zadig. In USB>DMX mode the unit
+# is an FT232R with no reset interface, so picotool reports no device — use the
+# panel route or switch modes first.
 
 # --- SWD with a probe (from pico2/) ----------------------------------------
 cd pico2
@@ -240,14 +255,16 @@ Six pages on the TFT (title row shows the page and the network state):
     `set fixture_1_3 G005`
 - **LEDs** — LEDs per port (×8, up to 600)
 - **System** — Ethernet enable (applies at boot), backlight, LED Power
-  (External / USB brick)
+  (External / USB brick), and **Firmware**: shows the running version; Select
+  twice reboots into the RP2350's USB drive for an update (see Build / flash)
 
 Buttons: Up/Down move the selection (crossing a page edge changes page), Select
 starts editing, Esc jumps to the next page. While editing, Up/Down change the
 highlighted digit (or cycle an enum), Select moves to the next digit and commits
 after the last one (written to EEPROM), Esc cancels. The bottom row of every
 page says the same thing for the row that is selected (`Sel edit`, `Sel open`
-for a port's fixture table, `Esc back` inside one).
+for a port's fixture table, `Esc back` inside one, `Sel update` on the Firmware
+row and `Sel reboot   Esc cancel` once it is armed).
 
 What the panel's colours mean: the title bar is a different colour per page;
 the selected row is a dark blue bar; labels are grey and values white; blue is

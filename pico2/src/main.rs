@@ -84,6 +84,7 @@ mod m24x02;
 mod panel_test;
 mod pca9633;
 mod pixfont;
+mod reboot;
 mod sacn_rx;
 mod smart_led;
 mod identity;
@@ -355,9 +356,9 @@ async fn boot_task(
                 let _ = ee.write_byte_wait(eeprom::BOOT_FAIL_COUNT_ADDR, 0).await;
             }
             info!("boot: complete");
-            // Only now may the USB identity watcher reset the board; see
-            // `usb_device::usb_identity_watch_task`.
-            usb_device::mark_boot_complete();
+            // Only now may a software reboot happen - the identity watcher's,
+            // or a firmware update's; see `reboot.rs`.
+            reboot::mark_boot_complete();
             return;
         }
         error!("boot: success flag write attempt {} not confirmed", attempt);
@@ -369,7 +370,7 @@ async fn boot_task(
     error!("boot: flag could not be stored - EEPROM unreachable? Continuing with output enabled.");
     let _ = channels::CHANNEL.try_send(RouterEvent::StoreBootStatus(Some(BootStatus::Success)));
     // This boot did finish, whatever the EEPROM thinks.
-    usb_device::mark_boot_complete();
+    reboot::mark_boot_complete();
 }
 
 /// Network bring-up: W6300 reset, MAC from the EEPROM, DHCP or the configured
@@ -645,7 +646,11 @@ fn main() -> ! {
         // widget plus the console line protocol `dmx_console` talks to. An
         // input like the network, so it sits alongside it rather than
         // competing with the UI on core 1.
-        // Reboots the board when the stored mode needs the other USB identity;
+        // Every software reboot - the identity watcher's, or a firmware
+        // update from the panel or picotool - is carried out here, after the
+        // boot-complete gate; see `reboot.rs`.
+        s.spawn(unwrap!(reboot::reboot_task()));
+        // Asks for a reboot when the stored mode needs the other USB identity;
         // see `usb_device::usb_identity_watch_task`.
         s.spawn(unwrap!(usb_device::usb_identity_watch_task(unwrap!(
             channels::CHANNEL_LOG.receiver()

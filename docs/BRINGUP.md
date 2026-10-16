@@ -139,8 +139,10 @@ Do: W6300-EVB-Pico2 in the socket (U1), supply on. Nothing on the strips or USB 
     fixtures. Selecting a strip row highlights only its label. The LED page shows the universe
     budget bar under `Universes`.
   - Footer on every page (`Up Dn move   Sel edit  Esc page`); `Sel open` on a port row under
-    `Fixtures`, `Esc back` inside a table, and the edit wording while editing. Nothing on any page
-    is hidden behind it (Layout, the fullest, has nine rows; System's power note ends on row 7).
+    `Fixtures`, `Esc back` inside a table, `Sel update` on System's Firmware row,
+    `Sel reboot   Esc cancel` while it is armed, and the edit wording while editing. Nothing on
+    any page is hidden behind it (Layout, the fullest, has nine rows; System has four plus the
+    power note on rows 6-8).
   - Idle screen after 30 s without a button: digits match `DMX Address`, one bar per port to the
     same scale as the Layout strips, the lamp follows the input, the IP and power note match the
     title bar. Any button returns to the menu on the same row, redrawn cleanly (no remnants of the
@@ -632,6 +634,32 @@ the CDC port had, at the cost of our own console.
   console's own DMX monitor to confirm fader N moves channel N before suspecting the board.
   `tools/enttec.py --map 12` is the reference: it drives known channels with no console in the loop.
 - ✓ **Automatic re-enumeration** (2026-09-17). Change the mode into `USB>DMX` and out again. Each crossing reboots the board after ~750 ms and it comes back as the other device; changes that do not cross the boundary (`DMX` ↔ `ArtNet`, say) must **not** reboot. After two crossings in a row, `info` must still show `boot=Some(Success)` and Ethernet must still come up — that is the lockout guard staying clear.
+- [ ] **Firmware update without the button (2026-10-16).** Two triggers, one reboot path (`reboot.rs`).
+  - Panel, in `DMX` mode: System → `Firmware` shows `fw <version>` in blue. Select → `Sel again` in
+    amber, footer `Sel reboot   Esc cancel`. Esc, Up or Down disarms with the cursor staying put;
+    left alone 10 s it disarms; the idle screen must not take over while armed. Select again →
+    the panel shows `USB drive mode`; within ~1 s the PC mounts the `RP2350` drive. Copy
+    `pico2.uf2`; the unit restarts and the row shows the new version.
+  - Same in `USB>DMX` mode (FT232R identity): identical behaviour — this is the only trigger
+    that works there.
+  - picotool, CDC identity: `picotool info -f` makes the device drop off, prints the binary-info
+    name `DMX Interface`, and the unit comes back as the application. Then
+    `picotool load -f -x target/thumbv8m.main-none-eabihf/release/pico2.uf2` end to end. On
+    Windows, Device Manager shows a WinUSB-bound entry for the reset interface (`MI_04`, or
+    `MI_06` with `--features usb`) with no bang and the COM port numbers unchanged. No driver on
+    it → the PC cached the old descriptor set: delete
+    `HKLM\SYSTEM\CurrentControlSet\Control\usbflags\C0DEDCAF0020` and re-plug, or bump
+    `device_release` again. picotool finds no device while the COM ports are present → it is
+    filtering by VID: retry with `--vid 0xc0de --pid 0xdcaf`.
+  - `picotool reboot -f`: plain restart into the application.
+  - `picotool load -f …` while in `USB>DMX` mode fails cleanly ("No accessible RP-series
+    devices…") and the FT232R port keeps working.
+  - After each of the above, `info` shows `boot=Some(Success)`, the boot log has no "consecutive
+    incomplete boot(s)", and Ethernet comes up. Optionally `picotool info -f` straight after
+    power-on, to exercise the boot-complete gate and its 5 s bound.
+  - Does the panel stay lit through the bootrom reboot? Expected yes (the TCA9555 and PCA9633
+    hold the panel's reset and backlight and are not reset with the RP2350). If it blanks,
+    behaviour is still correct, only less informative — note it here.
 - ✓ **Widget in a non-`USB>DMX` mode (CDC)** (2026-09-17, `DMX` mode). `tools/enttec.py --port COMn --params` round-trips on the **first** CDC port: `7e0305002c01100228e7` → firmware 1.44, break 16, MAB 2, refresh 40 Hz — the same reply the FT232R identity gives, so the framing is identity-independent. `OUTPUT_DMX` is refused by design (`enttec_widget.rs:68`) so a PC left plugged in cannot overwrite live wired-DMX or Art-Net data; `tools/enttec.py` now warns before those commands instead of appearing dead.
   - Also proves the **other direction**, which no earlier test had: `--monitor` decoded the unprompted label-5 frames the board sends when the universe it receives changes, e.g. `start 0x00 | 0 0 255 ...`. That is `payload[1]` = channel 1, so a lit channel 3 is pixel 1 blue — the same convention the QLC+ session showed, confirmed from the bytes rather than inferred from the LEDs.
   - And it clears the risk the `usb_toggle` wrapper introduced: that wrapper sits under **all three** CDC functions, and the widget and console both work with it in place.
@@ -907,6 +935,9 @@ in that mode - use the default build and a probe to debug `USB>DMX`.
 - [ ] Forced fault: hold core 1 (breakpoint in `buttons::run` with `pause_on_debug` temporarily false) → reset within 4 s and `previous reset: WATCHDOG TIMEOUT` in the next boot log.
 - [ ] Brown-out: dip the supply to 3.5 V for 100 ms → clean reboot, settings intact, no corrupted EEPROM page.
 - [ ] Hot-plug a strip while running: no reset, other ports unaffected.
+- [ ] A firmware update (panel or `picotool -f`) never trips the incomplete-boot guard: after it,
+  `boot=Some(Success)` and Ethernet up, every time, including when triggered within a second of
+  power-on.
 - [ ] 8 h soak at full load: no reset, no drift in `V_SYS`; D2, U9 and U10 temperatures stable (D1 stays cold).
 
 ## Stage 10 — Power board at load

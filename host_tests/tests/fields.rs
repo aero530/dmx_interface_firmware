@@ -605,3 +605,41 @@ fn every_editable_field_actually_transfers() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The firmware-update action on the System page.
+
+#[test]
+fn firmware_update_is_an_action_not_a_setting() {
+    let field = FieldId::UpdateFirmware;
+    assert!(field.is_action());
+    assert!(!field.editable(), "an action has no value to edit");
+    assert_eq!(field.digits(), 0, "and no digits for the cursor to land on");
+    let system = PAGES.iter().find(|p| p.title == "System").expect("System page");
+    assert!(system.fields.contains(&field), "the action lives on the System page");
+    assert_ne!(
+        system.fields.first(),
+        Some(&field),
+        "the row the page opens on must not be the one that reboots the board"
+    );
+    assert_eq!(all_fields().filter(|f| f.is_action()).count(), 1);
+
+    // The console can neither set it nor move it.
+    let mut data = defaults();
+    assert!(field.set_from_str(&mut data, "now").is_err());
+    field.adjust(&mut data, 0, true);
+    field.adjust(&mut data, 0, false);
+    assert_eq!(data, defaults(), "an action never touches the settings");
+}
+
+#[test]
+fn system_page_leaves_room_for_the_usb_note() {
+    // Mirrors `pico2::tft_ui::USB_NOTE`: three amber lines drawn under the
+    // System page's last row, after one blank row, above the footer.
+    const USB_NOTE_LINES: usize = 3;
+    let system = PAGES.iter().find(|p| p.title == "System").expect("System page");
+    assert!(
+        system.fields.len() + 1 + USB_NOTE_LINES <= common::ui::fields::MAX_FIELDS_PER_PAGE,
+        "the System page's rows plus the power note must fit above the footer"
+    );
+}

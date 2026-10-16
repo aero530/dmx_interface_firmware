@@ -65,7 +65,7 @@ use common::activity;
 use common::buffers::{fixture_map, set_fixture_map};
 use common::channels::{RouterChannelTx, UiChannelRx, CHANNEL_EEPROM};
 use common::event_router::RouterEvent;
-use common::events::{EepromEvent, NetStatus, UiEvent};
+use common::events::{EepromEvent, NetStatus, RebootRequest, UiEvent};
 use common::ui::fields::{FieldId, Page, MAX_FIELDS_PER_PAGE, VALUE_COLUMN};
 use common::ui::fixtures::{FixtureMap, StripCell};
 use common::ui::{backlight_duty, LedGrouping, MenuData, ModuleSettings, DEFAULT_BACKLIGHT, PAGES};
@@ -323,6 +323,22 @@ const _: () = core::assert!(USB_NOTE[2].len() <= USABLE_COLUMNS);
 const FOOTER_EDIT: &str = "Up Dn change Sel next  Esc cancel";
 const _: () = core::assert!(FOOTER_EDIT.len() <= USABLE_COLUMNS);
 
+/// The footer on an action row, and once the action is armed.
+const FOOTER_ACTION: &str = "Up Dn move   Sel update  Esc page";
+const FOOTER_CONFIRM: &str = "Sel reboot   Esc cancel";
+const _: () = core::assert!(FOOTER_ACTION.len() <= USABLE_COLUMNS);
+const _: () = core::assert!(FOOTER_CONFIRM.len() <= USABLE_COLUMNS);
+
+/// An armed action that is not confirmed within this many seconds disarms
+/// itself - long enough to read the footer, short enough that a row left
+/// armed by mistake is not a trap for the next person at the panel.
+const CONFIRM_SECS: u32 = 10;
+
+/// What the `Firmware` row shows when it is not armed. The target crate's
+/// version, which `common` cannot see, so it is drawn here rather than by
+/// `FieldId::display`.
+const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Chip select is a static line on the expander, so the SPI bus abstraction
 /// gets a pin that does nothing.
 ///
@@ -386,6 +402,11 @@ static DI_BUFFER: StaticCell<[u8; 512]> = StaticCell::new();
 /// cannot leak into stored settings.
 enum Mode {
     Navigate,
+    /// An action row is armed: the next Select carries it out, anything else
+    /// disarms it, and so does `CONFIRM_SECS` of silence. Entered only from
+    /// `Navigate` by Select on an action row, and buttons report releases
+    /// only, so one held press cannot arm *and* fire.
+    Confirm,
     Edit { digit: u8, draft: MenuData },
     /// Editing a fixture row.
     ///
@@ -492,6 +513,8 @@ fn usb_power_text() -> String {
 /// is what it does there.
 fn footer_text(mode: &Mode, page: &Page, field: FieldId, data: &MenuData) -> String {
     match mode {
+        Mode::Navigate if field.is_action() => String::from(FOOTER_ACTION),
+        Mode::Confirm => String::from(FOOTER_CONFIRM),
         Mode::Navigate => {
             let sel = if field.port_unused(data) {
                 "-   "
@@ -618,6 +641,25 @@ fn draw_splash(display: &mut Tft, net: NetStatus) {
     let version = format!("Rev 2   fw {}", env!("CARGO_PKG_VERSION"));
     text(display, &version, PX_MARGIN, PX_BOTTOM_LINE, PX_CAPTION);
     draw_splash_status(display, net);
+}
+
+/// The last thing the panel shows before a software reboot.
+///
+/// For a firmware update it stays up for as long as the module is a USB drive:
+/// the bootrom reboot resets the RP2350, not the carrier's I²C parts that hold
+/// the panel's reset and backlight, so what is drawn here is what the operator
+/// reads while copying the file.
+fn draw_update_screen(display: &mut Tft, req: RebootRequest) {
+    let _ = display.clear(Rgb565::BLACK);
+    match req {
+        RebootRequest::Bootsel { .. } => {
+            text(display, "Firmware update", PX_MARGIN, 30, Rgb565::WHITE);
+            text(display, "USB drive mode", PX_MARGIN, 60, PX_INFO);
+            text(display, "Copy pico2.uf2 to the drive", PX_MARGIN, 90, PX_CAPTION);
+            text(display, "Power-cycle to cancel", PX_MARGIN, PX_BOTTOM_LINE, PX_NOTE);
+        }
+        RebootRequest::Flash => text(display, "Rebooting...", PX_MARGIN, 60, PX_CAPTION),
+    }
 }
 
 /// The splash's status line, redrawn on its own as the network comes up.
@@ -830,6 +872,12 @@ pub async fn ui_task(
                 net = status;
                 draw_splash_status(&mut display, net);
             }
+            // picotool can ask for an update inside the splash; show it rather
+            // than letting the arm below swallow it.
+            Either::First(UiEvent::Rebooting(req)) => {
+                draw_update_screen(&mut display, req);
+                core::future::pending::<()>().await;
+            }
             // A button, or time: on to the menu.
             Either::First(_) | Either::Second(()) => break,
         }
@@ -964,6 +1012,16 @@ pub async fn ui_task(
                     };
 
                     match &mode {
+                        // An action row: the running version, or the armed
+                        // prompt in amber once Select has been pressed on it.
+                        _ if field.is_action() => {
+                            let armed = selected && matches!(mode, Mode::Confirm);
+                            if armed {
+                                buf.set_string(VALUE_X, y, "Sel again", base.fg(NOTE_FG));
+                            } else {
+                                buf.set_string(VALUE_X, y, format!("fw {FW_VERSION}"), base.fg(INFO_FG));
+                            }
+                        }
                         // Show the draft, not the live value, and mark the digit
                         // being changed so it is obvious which one Up/Down moves.
                         Mode::Edit { digit, draft } if selected => {
@@ -1048,21 +1106,17 @@ pub async fn ui_task(
                 }
 
                 // The `LED Power` caveat, on whichever page carries that field.
-                if usb_power::status() & usb_power::ST_RPI_VBUS != 0 {
-                    if let Some(row) = page
-                        .fields
-                        .iter()
-                        .position(|f| matches!(*f, FieldId::LedPower))
-                    {
-                        let note = Style::new().fg(NOTE_FG);
-                        // Row 0 is the title, so a field at index `row` draws on
-                        // `row + 1`; the note follows it.
-                        let y = row as u16 + 2;
-                        for (i, line) in USB_NOTE.iter().enumerate() {
-                            let ny = y + i as u16;
-                            if ny < FOOTER_ROW {
-                                buf.set_string(CONTENT_LEFT, ny, *line, note);
-                            }
+                let carries_led_power = page.fields.iter().any(|f| matches!(*f, FieldId::LedPower));
+                if carries_led_power && usb_power::status() & usb_power::ST_RPI_VBUS != 0 {
+                    let note = Style::new().fg(NOTE_FG);
+                    // Below the page's last row with one blank row between, so
+                    // the amber text reads as a note on the page and not as the
+                    // value of whatever row happens to be last.
+                    let y = page.fields.len() as u16 + 2;
+                    for (i, line) in USB_NOTE.iter().enumerate() {
+                        let ny = y + i as u16;
+                        if ny < FOOTER_ROW {
+                            buf.set_string(CONTENT_LEFT, ny, *line, note);
                         }
                     }
                 }
@@ -1079,6 +1133,10 @@ pub async fn ui_task(
             Either::Second(()) => {
                 lamp = activity::take();
                 idle_secs = idle_secs.saturating_add(1);
+                // An armed action left alone disarms itself.
+                if matches!(mode, Mode::Confirm) && idle_secs >= CONFIRM_SECS {
+                    mode = Mode::Navigate;
+                }
                 if !home && idle_secs >= IDLE_SECS && matches!(mode, Mode::Navigate) {
                     home = true;
                     home_full = true;
@@ -1108,7 +1166,12 @@ pub async fn ui_task(
             // would be working from a stale base.
             (m, UiEvent::Load(new_data)) => {
                 data = new_data;
-                *m = Mode::Navigate;
+                // An armed action stays armed: there is no draft to go stale,
+                // and a `Load` can arrive on its own (DHCP, a console `set`)
+                // under the operator's finger.
+                if !matches!(m, Mode::Confirm) {
+                    *m = Mode::Navigate;
+                }
                 home_full = true;
                 if data.backlight != brightness {
                     brightness = data.backlight;
@@ -1120,6 +1183,12 @@ pub async fn ui_task(
             (_, UiEvent::Net(status)) => {
                 net = status;
                 home_full = true;
+            }
+            // Asked for from elsewhere (picotool): show what is about to
+            // happen and stop drawing the menu. `reboot_task` ends this boot.
+            (_, UiEvent::Rebooting(req)) => {
+                draw_update_screen(terminal.backend_mut().display_mut(), req);
+                core::future::pending::<()>().await;
             }
 
             // Up and Down are **inverted while navigating** and upright while
@@ -1151,6 +1220,9 @@ pub async fn ui_task(
                     // page, which stays live for exactly this reason.
                 } else if field.fixture_slot().is_some() {
                     mode = Mode::EditFixture { digit: 0, draft: fixture_map() };
+                } else if field.is_action() {
+                    // Arm it; the next Select carries it out.
+                    mode = Mode::Confirm;
                 } else if let Some(page) = group_size_port(field)
                     .filter(|_| grouping(&data) == LedGrouping::Fixtures)
                     .and_then(fixture_page)
@@ -1175,6 +1247,18 @@ pub async fn ui_task(
             (Mode::Edit { digit, draft }, UiEvent::Down) => field.adjust(draft, *digit, false),
             // Esc discards the draft outright.
             (m @ Mode::Edit { .. }, UiEvent::Esc) => *m = Mode::Navigate,
+
+            // The second Select on an armed action. Today the one action is
+            // the firmware update: draw the screen the operator will read while
+            // the module is a USB drive, then hand over to `reboot_task`.
+            (Mode::Confirm, UiEvent::Select) => {
+                let req = RebootRequest::Bootsel { disable_mask: 0 };
+                draw_update_screen(terminal.backend_mut().display_mut(), req);
+                crate::reboot::request(req);
+                core::future::pending::<()>().await;
+            }
+            // Anything else disarms it; the cursor stays where it was.
+            (m @ Mode::Confirm, UiEvent::Esc | UiEvent::Up | UiEvent::Down) => *m = Mode::Navigate,
 
             (Mode::EditFixture { digit, draft }, UiEvent::Up) => {
                 field.fixture_adjust(draft, port_leds(&data, field), *digit, true);

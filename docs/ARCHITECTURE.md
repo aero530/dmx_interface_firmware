@@ -348,6 +348,13 @@ bad boots, not one, because a single interrupted boot is normal during
 development; and if the EEPROM will not confirm the success write, **the local
 result is authoritative** — a dead settings chip must not black out the lights.
 
+Every software reboot — the USB identity change, and the firmware update's
+jump into the bootrom's BOOTSEL mode — goes through `pico2/src/reboot.rs`,
+which waits for the `Success` write before acting. That is why an update never
+counts against the guard: the flag is already `Success` when the board leaves,
+BOOTSEL mode never touches the EEPROM, and the new firmware's first boot reads
+`Success` and starts the count from zero.
+
 The SO8N footprint also takes an M24256 (32 KB) if presets or a fault log ever
 appear. That costs no PCB change but two firmware ones: 16-bit internal
 addressing (the M24256 sends two address bytes) and `PAGE_SIZE` 16 → 64.
@@ -830,6 +837,22 @@ Open work:
   is headroom, not a dependency.
 - **USB PID** for the CDC device still needs allocating — free options are
   [pid.codes](https://pid.codes) or a sub-PID under Raspberry Pi's VID `0x2E8A`.
+  The Raspberry Pi route has a second benefit: picotool treats such a unit as a
+  Pico-family device without `--vid/--pid` filters.
+- **Firmware update without the BOOTSEL button** is a software reboot into the
+  bootrom's BOOTSEL mode, nothing more: the running firmware never writes flash.
+  Two triggers — the panel's System → Firmware action, and picotool's reset
+  interface in the CDC identity (`picotool load -f -x`) — feed one request into
+  `pico2/src/reboot.rs`, which waits for `boot: complete` (bounded at 5 s) and a
+  750 ms settle before calling the bootrom. Waiting for the flag is what keeps
+  the incomplete-boot counter clear: `Success` has already been written, and
+  BOOTSEL mode never touches the EEPROM, so the next boot reads `Success` and
+  starts from zero. In `USB>DMX` mode the unit is an FT232R and only the panel
+  trigger exists. A real over-the-network update (the RP2350's A/B partitions
+  with try-before-you-buy, an image pushed over TCP) is the next step if units
+  are ever installed where only Ethernet reaches them; the socket table would
+  need a fifth slot and flash writes would need core 1 paused and the watchdog
+  fed.
 - **EEPROM priming writes** (`eeprom.rs`) are a Nucleo-era shared-bus workaround;
   bench-confirm page writes without them and delete.
 - Panel confirmations (pin order, controller, VCC, backlight drive) are bench

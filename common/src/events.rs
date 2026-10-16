@@ -153,6 +153,18 @@ pub enum NetStatus {
     Up([u8; 4]),
 }
 
+/// How the board has been asked to restart itself. See `pico2/src/reboot.rs`.
+#[derive(Copy, Clone, PartialEq, Eq, Format, Debug)]
+pub enum RebootRequest {
+    /// Into the RP2350 bootrom's BOOTSEL mode, where the module is a USB drive
+    /// that accepts a UF2. `disable_mask` is bits 0-6 of the picotool reset
+    /// request's wValue (1 = no mass storage, 2 = no PICOBOOT); 0 from the
+    /// panel, which wants both.
+    Bootsel { disable_mask: u8 },
+    /// A plain restart into the application.
+    Flash,
+}
+
 /// Action to be processed by the UI (often user interaction)
 #[derive(Format)]
 pub enum UiEvent {
@@ -163,4 +175,7 @@ pub enum UiEvent {
     Load(MenuData),
     /// Network status changed; shown on the display's title row.
     Net(NetStatus),
+    /// The board is about to restart; the panel shows what is happening and
+    /// stops drawing the menu.
+    Rebooting(RebootRequest),
 }

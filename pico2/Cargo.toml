@@ -88,7 +88,8 @@ embedded-io-async = "0.7"
 # = 6, and the fifth `push` trips an `assert!` inside `Builder`. That panic is a
 # hard fault on a board with no debugger, so it looks like the firmware does not
 # boot at all rather than like a USB fault - which is how it read on the bench,
-# 2026-09-17. 8 leaves room for a fourth function without a second hunt.
+# 2026-09-17. picotool's reset interface (`usb_device.rs`) is one more, so the
+# totals are 5 and 7 of the 8; the handler count is 3 and 4 of 8.
 embassy-usb = { version = "0.6.0", features = [
     "defmt",
     "max-interface-count-8",

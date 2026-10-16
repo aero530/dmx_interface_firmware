@@ -62,6 +62,12 @@ pub enum FieldId {
     LedPower,
     /// TFT backlight duty, 1..=255.
     Backlight,
+    /// A panel **action**, not a setting: reboot into the RP2350 bootrom's USB
+    /// drive so the firmware can be replaced without reaching the BOOTSEL
+    /// button. Stores nothing; `display()` is blank because the panel draws
+    /// the running version and the armed prompt itself. See
+    /// [`FieldId::is_action`].
+    UpdateFirmware,
 }
 
 /// Per-port field labels.
@@ -209,7 +215,15 @@ pub const PAGES: &[Page] = &[
     },
     Page {
         title: "System",
-        fields: &[FieldId::EthernetEnabled, FieldId::Backlight, FieldId::LedPower],
+        // The update action goes last: the page's first field is what
+        // `page_accent` keys on, and the row the cursor lands on when the page
+        // opens must not be the one that reboots the board.
+        fields: &[
+            FieldId::EthernetEnabled,
+            FieldId::Backlight,
+            FieldId::LedPower,
+            FieldId::UpdateFirmware,
+        ],
         kind: PageKind::Main,
     },
     // The per-port fixture tables. `Detail`, so the ring skips them; reached by
@@ -424,6 +438,7 @@ impl FieldId {
             FieldId::EthernetEnabled => "Ethernet(boot)",
             FieldId::LedPower => "LED Power",
             FieldId::Backlight => "Backlight",
+            FieldId::UpdateFirmware => "Firmware",
         }
     }
 
@@ -460,6 +475,7 @@ impl FieldId {
             FieldId::EthernetEnabled => "ethernet_enabled",
             FieldId::LedPower => "led_power",
             FieldId::Backlight => "backlight",
+            FieldId::UpdateFirmware => "update_firmware",
         }
     }
 
@@ -471,6 +487,7 @@ impl FieldId {
             | FieldId::TotalUniverses
             | FieldId::UniversesBound
             | FieldId::TotalChannels
+            | FieldId::UpdateFirmware
         )
     }
 
@@ -715,6 +732,9 @@ impl FieldId {
                 LedPower::External => "External",
                 LedPower::UsbBrick => "USB brick",
             }),
+            // Nothing to show from here: the panel draws the firmware version
+            // (which only the target crate knows) and the armed prompt.
+            FieldId::UpdateFirmware => String::new(),
             _ => String::new(),
         }
     }
@@ -806,6 +826,11 @@ impl FieldId {
 
     /// Parse and apply a console-supplied value.
     pub fn set_from_str(&self, data: &mut MenuData, value: &str) -> Result<(), &'static str> {
+        if self.is_action() {
+            // Before the read-only check: "read-only" would suggest there is a
+            // value here that merely cannot be written.
+            return Err("panel action, not a setting");
+        }
         if !self.editable() {
             return Err("read-only field");
         }
@@ -927,6 +952,15 @@ impl FieldId {
             FieldId::Fixture(port, slot) => Some((*port, *slot)),
             _ => None,
         }
+    }
+
+    /// A row that *does* something when selected rather than holding a value.
+    ///
+    /// Not editable, not listed by the console's `get` (there is no value to
+    /// report), and `set` refuses it. The panel decides what selecting it
+    /// means - today the one action is [`FieldId::UpdateFirmware`].
+    pub fn is_action(&self) -> bool {
+        matches!(self, FieldId::UpdateFirmware)
     }
 
     /// `F010` for a lit run of ten, `G005` for a five-LED gap, `----` for an
